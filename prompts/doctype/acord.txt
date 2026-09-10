@@ -1,0 +1,29 @@
+### DOCUMENT TYPE: ACORD FORM
+
+You are reading a standardized ACORD form. Its defining property is that almost all of the ink on the page is a PRE-PRINTED TEMPLATE - captions, section headings, checkbox labels and currency markers that are identical on every copy of the form ever issued - and only a small part is the FILLED DATA for this particular transaction.
+
+Your job is to extract the filled data and bind each value to the caption that governs it. A caption with nothing filled beside it is an empty field of this form, not a value.
+
+Expect:
+- The form's identity in the footer: the ACORD form number and its edition, plus the page number.
+- A header block: form title, and the date of the transaction.
+- A producer or agency block, and a company/carrier block, each with address, phone and codes.
+- An insured and mailing address block, and a customer id.
+- Effective and expiration dates, frequently paired with a time and an AM/PM or 12:01/noon selector.
+- Sectioned coverage grids by type of insurance, each with its own caption column and one or more limit or amount columns.
+- Interest, mortgagee, loss payee or additional insured blocks near the foot of the form.
+- An authorized representative signature area.
+
+### WHAT THIS DOCUMENT TYPE GETS WRONG MOST OFTEN
+
+1. The template is mostly empty, and that is the correct answer. A blank ACORD form and a completed one contain nearly the same text. Every caption of every section is printed whether or not it applies, and most currency boxes on a typical form are left blank. An empty box beside a printed caption is an absent value and must be recorded as such. Populating empty boxes because the caption exists is the characteristic failure on this document type, and it manufactures coverage the insured does not have.
+
+2. Caption-to-value binding is SPATIAL, not sequential. Because the filled data and the pre-printed template are separate layers of the page, a linear reading of the text can emit every filled value first and every caption afterwards, or interleave them in an order that has nothing to do with the visual layout. The consequence is specific and severe: an amount can appear in the text stream immediately after a caption it does not belong to, while the caption it does belong to sits elsewhere on the page. Bind each value to the caption it is physically adjacent to on the page - the box it sits inside - and never to whichever caption happens to precede it in a text stream.
+
+3. Checkboxes carry meaning in both states. A marked box selects an option; an unmarked box beside the same caption declines it. Where the schema provides for a selection, report which option is marked. Do not infer a selection from surrounding text, and do not treat an unmarked box as if the question were never asked.
+
+4. Paired selectors. Dates on these forms often come with a time and a selector such as AM/PM or 12:01/noon. The mark belongs to one of the pair; read which.
+
+5. Later pages are usually conditions. Continuation pages of many ACORD forms carry standard contractual conditions, statutory notices and cancellation terms. That text is form boilerplate, not transaction data. Extract data from it only where the schema explicitly asks for it.
+
+6. Copy identifiers exactly. Form numbers, editions, agency codes, sub codes, customer ids, binder numbers and policy numbers are identifiers. Reproduce every character and separator as printed.

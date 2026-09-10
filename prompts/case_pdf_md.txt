@@ -1,0 +1,3 @@
+You receive the document one page at a time: for each page you get a header line naming its position in the file, that page's image, and the OCR text read off that same page. The image and the OCR text next to it are two views of ONE page, not two different pages.
+
+For each page, use its OCR text as the primary source and its image to verify and correct it. The image is authoritative for anything OCR cannot convey: table alignment, thin rules, which column a figure sits under, and any text OCR missed or garbled. Where the two disagree, trust the image. A page whose OCR text is marked "(none)" must still be extracted - read it from the image alone.

@@ -1,0 +1,27 @@
+### DOCUMENT TYPE: LOSS RUN
+
+You are reading a loss run: a carrier's report of claims history for an insured. It is a financial report, not a contract. Its purpose is to state how many claims were made under which policy terms, and what each one cost.
+
+Expect these blocks:
+- A report header: carrier or third-party administrator, report title, run date and time, valuation date, requester or user id, report id, and filters applied. The valuation date and the run date are different dates and both matter - figures are stated as of the valuation date.
+- The insured, and usually the agency or producer, with addresses.
+- One or more policy terms, each with a policy number, a line of business and an effective and expiration date.
+- Claim rows: claim or occurrence number, date of loss, date reported, status, cause or type of loss, claimant, and a set of financial columns.
+- Financial columns typically covering paid loss, outstanding reserves, paid plus reserves, allocated expenses, recoveries and a total. Column sets vary by carrier - take them from the printed headers, never from an assumed layout.
+- Subtotal and total rows.
+
+### WHAT THIS DOCUMENT TYPE GETS WRONG MOST OFTEN
+
+1. Totals are not claims. Rows labelled as a total, a grand total, a subtotal, an all-years line or a per-policy summary are aggregates over other rows. They must be recorded as totals where the schema provides for them, and must never be emitted as if they were individual claims. A loss run whose claim list silently includes its own total rows double-counts the insured's loss history, which is the single most damaging error possible in this document type.
+
+2. Summary reports versus detail reports. Some loss runs list one row per policy term with a claim count, and never name an individual claim. Others list every claim. Do not invent claim-level rows from a summary, and do not collapse a detail report into per-term counts. Extract the granularity actually printed.
+
+3. Zero is a value. A claim closed with no payment prints a real zero in its financial columns. Zero is not missing data: record it as zero. Only a genuinely empty cell is absent.
+
+4. Row identity in wide tables. These tables are wide, and a claim's identifiers may print at the far left while its money prints at the far right, with the row bound together only by its horizontal band. Keep every figure with the claim it shares a row with. A linear text reader frequently emits all the identifiers together and then all the amounts together; that ordering is an artefact and must not be used to pair them.
+
+5. Repeated context. The insured, the agent and the policy number may reprint on every row, or may print once and be implied for the rows beneath. Neither pattern licenses inventing a value: carry a value down only where the document's own layout plainly shows the rows are grouped under it, and never across a change of policy term.
+
+6. Currency and sign. Recoveries and credits may print negative or in parentheses. Preserve the sign.
+
+7. Disclaimers are not data. These reports carry substantial legal boilerplate about the limits of the information. It is not claim content.

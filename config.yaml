@@ -1,0 +1,304 @@
+# POC3 - two VL models x three input modalities, scored per field against a golden
+# canonical JSON.
+#
+# Every relative path resolves against the directory holding this file.
+#
+# The comparison is only valid if NOTHING differs between the six cells except the
+# model weights and the modality paragraph. Do not add per-model or per-case
+# overrides to `inference` or `prompt` - that is how a benchmark starts measuring
+# its own harness.
+
+project:
+  name: poc3-vl-modality-matrix
+  run_id: null                 # null -> UTC timestamp at start; set a string to resume a run
+
+paths:
+  input_dir: input
+  # Fallback only. A per-PDF schema found beside the PDF always wins - see
+  # doc_types below and common.discover_documents().
+  schema: null
+  work_dir: work
+  ocr_dir: work/ocr
+  cache_dir: work/cache
+  output_dir: output
+  report_dir: output/report
+  system_prompt: prompts/system_prompt.txt
+  # The modality paragraph: what inputs this case supplies. Varies by case ONLY.
+  case_prompts:
+    pdf_only: prompts/case_pdf_only.txt
+    pdf_md:   prompts/case_pdf_md.txt
+    md_only:  prompts/case_md_only.txt
+  # The user-turn preamble for each case.
+  user_prompts:
+    pdf_only: prompts/user_pdf_only.txt
+    pdf_md:   prompts/user_pdf_md.txt
+    md_only:  prompts/user_md_only.txt
+
+# The three document types. Each has its own folder under input/ and its own
+# doc-type paragraph in the prompt. `name` is what the user turn calls it.
+#
+# Within one (doc_type, case) both models get byte-identical input, and across
+# cases only the modality paragraph changes - so the model comparison and the
+# modality comparison both stay valid. Prompts differ BETWEEN doc types by
+# design; report.prompt_integrity() checks the invariants per doc type.
+doc_types:
+  - id: policy
+    dir: policy
+    name: Policy Declarations
+    prompt: prompts/doctype/policy.txt
+  - id: loss_run
+    dir: loss runs
+    name: Loss Run
+    prompt: prompts/doctype/loss_run.txt
+  - id: acord
+    dir: acord forms
+    name: ACORD Form
+    prompt: prompts/doctype/acord.txt
+
+corpus:
+  documents: null              # null = every PDF under input_dir. Or a list of doc_ids.
+  require_gold: true           # false = run inference on unpaired PDFs, skip scoring
+  # Suffixes a labeller commonly appends to the gold file's name, stripped when
+  # pairing a PDF with its gold JSON.
+  # Stripped from a file stem when pairing a PDF with its gold. "canonical" and
+  # "json" are here so BOP.pdf pairs with bop_canonical_golden_json.json by NAME
+  # rather than relying on the single-PDF-single-gold fallback, which stops
+  # working the moment a second document is added.
+  gold_suffixes: [extraction, extracted, gold, golden, groundtruth, gt,
+                  expected, label, labels, labelled, labeled, annotation,
+                  annotations, canonical, json]
+
+pod:
+  id: "3y7rmh7brswr5e"
+  proxy_template: "https://{pod_id}-{port}.proxy.runpod.net"
+  # The RunPod proxy is public - anyone with the pod id can reach these ports -
+  # so both servers require a key. It is read from the environment rather than
+  # written here, because this file is committed:
+  #     export POC3_API_KEY=<the same key passed to `vllm serve --api-key`>
+  api_key: "${POC3_API_KEY}"
+  ocr_api_key: "${POC3_API_KEY}"   # sent as X-POC3-Key to MinerU
+  verify_tls: true
+
+models:
+  - tag: 7B
+    model_id: Qwen/Qwen2.5-VL-7B-Instruct
+    served_name: qwen2.5-vl-7b
+    port: 8000
+    max_model_len: 98304
+    max_images: 24             # must match --limit-mm-per-prompt on the server
+  - tag: 8B
+    model_id: Qwen/Qwen3-VL-8B-Instruct
+    served_name: qwen3-vl-8b
+    port: 8003        # 8001 is held by RunPod's nginx
+    max_model_len: 98304
+    max_images: 24
+
+cases: [pdf_only, pdf_md, md_only]
+
+# On-disk folder names. Internal ids stay slugs; these are what you read.
+# Output layout is  output/<model tag>/<case>/<doc type dir>/<doc>.json
+case_dir_names:
+  pdf_only: "PDF only"
+  pdf_md:   "PDF+MD"
+  md_only:  "MD only"
+
+render:
+  dpi: 200
+  max_long_side_px: 1024       # ~1000 image tokens/page on the 28px patch grid
+  archive_format: png          # what lands in work/ocr (lossless, stable hash)
+  wire_format: jpeg            # what is base64'd into the request (small)
+  jpeg_quality: 88
+  max_total_payload_mb: 24     # HARD refusal above this, not a warning
+
+ocr:
+  mode: pod                    # pod | pymupdf | none
+  port: 8002
+  backend: pipeline            # MinerU 2.x backend
+  lang: en
+  device: cuda
+  keep_discarded_blocks: true  # MinerU misfiles real content as "discarded"; keep it
+  poll_interval_s: 3
+  job_timeout_s: 900
+  upload_timeout_s: 300
+  cache: true                  # reuse work/ocr/<doc_id>/page_N.md if present
+  fallback_to_pymupdf: false   # true only for dry runs; a scan has no text layer
+
+inference:
+  stream: true                 # MANDATORY: the RunPod proxy kills requests idle >100s
+  allow_nonstream: false
+  temperature: 0.0
+  top_p: 1.0
+  seed: 0
+  # Fallback only, for a document with no gold to size against.
+  max_tokens: 16384
+  # A cell has to be able to emit a COMPLETE answer, and one global ceiling
+  # cannot do that across this corpus: the smallest gold pretty-prints to ~1,600
+  # tokens and BOP's to ~21,500. At a global 16384 every BOP cell was cut off
+  # mid-JSON at exactly the cap and retried at 1.5x - a doubled GPU pass that
+  # still did not fit, and a score that measured where the ceiling was rather
+  # than how well the model extracts. So the budget is derived from the gold for
+  # THIS document. It is one number per document, identical across all six of
+  # its cells, so the model-vs-model and case-vs-case comparison is untouched.
+  budget_from_gold: true
+  chars_per_token: 3.77        # measured on this corpus's pretty-printed JSON
+  # Models emit nulls, repeated keys and whitespace the gold does not. Measured
+  # on BOP: the gold pretty-prints to 21,468 tokens, and 8B/pdf_md consumed a
+  # full 24,576 (1.15x) and was STILL truncated mid-JSON. 1.4x was not enough.
+  budget_margin: 1.6
+  budget_floor: 16384          # the value the other 11 documents were run at; the
+                               # budget may only ever rise, never fall, or a cell
+                               # that already succeeded could newly truncate
+  budget_ceiling: 32768        # worst-case prompt (~40k) + this stays under max_model_len
+  include_usage: true
+  connect_timeout_s: 30
+  first_byte_timeout_s: 240    # prefill of ~40k tokens with 9 images, scanned
+  inter_chunk_timeout_s: 120   # a 20k-token answer decodes for many minutes; 60s
+                               # was tight enough that a slow stretch read as a stall
+  total_timeout_s: 1800
+  retries: 2
+  retry_backoff_s: 10
+  retry_on_length: true        # one retry at max_tokens*1.5 if finish_reason == "length"
+  request_concurrency: 1       # both models share one GPU; serialize
+  extra_body: {}               # escape hatch for vLLM-only params
+
+prompt:
+  schema_style: both           # json | outline | both
+  max_md_chars_per_page: 20000
+  truncate_md_notice: "...[page markdown truncated]"
+
+scoring:
+  primary_metric: field_f1
+  auto_entity_lists: true      # any unlisted list-of-dicts aligns by value similarity
+  # list path -> ordered identity-key attempts. Each attempt is an AND-group of
+  # fields; a key is used only when it is unique on BOTH sides, so a weaker key
+  # is tried next rather than cross-pairing.
+  # Tune until selftest assertion 4 (list reversal) scores 1.000 for every gold.
+  # Paths use [] for "each item of that list", e.g. coverages[].line_items
+  # Keyed per document type. A list only needs an entry here when value
+  # similarity cannot align it on its own; selftest assertion 4 names any list
+  # that still fails after these are applied.
+  entity_lists:
+    # --- ACORD forms (24, 25, 35, 75) ---
+    insurers:                                      [[letter], [name], [naic_code]]
+    interested_parties:                            [[name], [interest_type, name]]
+    coverages.property.line_items:                 [[coverage_form_verbatim], [amount, deductible]]
+    coverages.workers_compensation.limits:         [[label], [amount]]
+    other_coverage_rows:                           [[type_of_insurance_verbatim], [policy_number], [insr_ltr]]
+    other_coverage_rows[].limits:                  [[label], [amount]]
+    special_conditions.items:                      [[label], [value]]
+    description_of_operations.risk_locations:      [[label], [address.line1]]
+    state_notices:                                 [[jurisdiction], [text_verbatim]]
+    document.additional_pages:                     [[page], [content_type, form_edition]]
+    extraction_meta.validation_flags:              [[code, pointer], [code], [message]]
+    extraction_meta.unresolved_fields:             [[pointer], [reason]]
+    # --- Loss runs (Liberty Mutual, AIG, AmTrust) ---
+    # policy_number alone is NOT unique on these reports: one policy prints once
+    # per term, so the term belongs in the key. Measured on the Liberty Mutual
+    # gold with list reversal: with value-similarity enabled both key choices
+    # reach 1.000, but with similarity off the composite key still reaches 1.000
+    # where policy_number alone drops to 0.910. The key is the belt; similarity
+    # is the braces.
+    account_summary.policy_terms:                  [[policy_number, policy_term_verbatim], [policy_term_verbatim], [term_effective_date]]
+    account_summary.totals:                        [[label]]
+    account_detail.policy_groups:                  [[policy_number, policy_term_verbatim], [policy_term_verbatim], [term_effective_date]]
+    account_detail.policy_groups[].claims:         [[claim_number], [loss_date, claimant_name]]
+    policy_sections:                               [[policy_number], [policy_term_verbatim]]
+    policy_sections[].claims:                      [[claim_number], [one_claim_number], [loss_date, claimant_name]]
+    policy_terms:                                  [[policy_number], [term_effective_date], [term_effective_verbatim]]
+    totals:                                        [[label]]
+    report_totals:                                 [[label, scope_value], [label]]
+    report_parameters.policies_listed:             [[policy_number]]
+    disclaimers:                                   [[text_verbatim]]
+    # --- Policy declarations (auto, boat, dwelling fire, homeowners) ---
+    # A forms schedule may print the SAME form number twice with different
+    # limits (HOME prints ML-48 0699 twice), so the limit is carried in the key
+    # to keep the two rows distinguishable without relying on value similarity.
+    # On the current golds both key choices score identically; this is a guard
+    # against a future gold where similarity alone would not separate them.
+    forms_endorsements:                            [[form.form_number_full, limit.raw_text], [form.form_number_full, premium.raw_text], [coverage_name, limit.raw_text]]
+    forms_and_endorsements.forms:                  [[form_number_full], [form_number, edition]]
+    policy_coverages:                              [[coverage_code], [coverage_name]]
+    policy_coverages[].limit.components:           [[qualifier], [amount]]
+    discounts_surcharges:                          [[name], [name, loc_bldg]]
+    property_characteristics:                      [[loc_bldg]]
+    property_characteristics[].attributes:         [[name], [name, value]]
+    special_interests:                             [[name], [interest_type, name]]
+    locations:                                     [[location_number], [address_verbatim]]
+    locations.entries:                             [[location_number], [address_verbatim]]
+    policy_conditions:                             [[text_verbatim]]
+    # Dwelling fire: coverage names repeat across sections (EC - Residence vs
+    # EC - Personal Property), so the section band belongs in the key.
+    properties:                                    [[property_number], [property_label_verbatim]]
+    properties[].coverages:                        [[coverage_name, section], [coverage_name]]
+    rating_information:                            [[subject], [subject, property_label]]
+    rating_information[].attributes:               [[name], [name, value]]
+    # Auto: the per-vehicle grids are keyed by their printed row caption, and
+    # each row's values by the vehicle COLUMN they sit under.
+    vehicles:                                      [[vehicle_number], [vin]]
+    vehicle_coverages:                             [[attribute]]
+    vehicle_coverages[].values:                    [[vehicle_number]]
+    additional_vehicle_information:                [[attribute]]
+    additional_vehicle_information[].values:       [[vehicle_number]]
+    vehicle_discounts:                             [[attribute]]
+    vehicle_discounts[].values:                    [[vehicle_number]]
+    vehicle_usage:                                 [[vehicle_number]]
+    vehicle_garaging:                              [[vehicle_number]]
+    additional_interests:                          [[vehicle_number, interest_type], [name]]
+    drivers:                                       [[driver_number], [name]]
+    insurance_scores:                              [[name, ordered_date], [ordered_date]]
+    general_policy_information:                    [[field]]
+    manual_losses:                                 [[date, description], [date]]
+    violations:                                    [[driver_number, date], [date]]
+    exceptions:                                    [[level, type], [type]]
+    remarks.sections:                              [[heading], [text]]
+    # BOP declarations: 60 coverages across 3 parts, 53 attribute rows beneath
+    # them. coverage_name is unique within a part and is the reliable key; the
+    # form number backs it up. Attributes repeat the same name ("Waiting Period"
+    # appears under 8 different coverages) so they can only be keyed WITHIN their
+    # parent coverage, which the [] path notation already scopes them to.
+    coverage_parts[].coverages:                    [[coverage_name], [form.form_number_full], [coverage_name, limit.raw_text]]
+    coverage_parts[].coverages[].attributes:       [[name], [name, value.raw_text]]
+    coverage_parts[].coverages[].attributes[].value.components: [[qualifier], [amount]]
+    coverage_parts[].blanket_limits:               [[name]]
+    coverage_parts[].other_forms:                  [[form_number_full], [form_number, edition]]
+    common_forms:                                  [[form_number_full], [form_name]]
+    locations[].valuation:                         [[property_type], [basis]]
+    policy.policy_period.exceptions:               [[jurisdiction]]
+    premium_summary.components:                    [[description], [category, description]]
+    footnotes:                                     [[marker], [text]]
+    # Boat: nested coverage parts -> locations -> rated items.
+    contact_info.entries:                          [[type], [information]]
+    coverage_parts:                                [[part_name]]
+    coverage_parts[].locations:                    [[location_label]]
+    coverage_parts[].locations[].rated_items:      [[item_type]]
+    coverage_parts[].locations[].rated_items[].attributes: [[name], [name, value]]
+    coverage_parts[].locations[].rated_items[].coverages:  [[coverage_name]]
+  # Identifier-named fields stay strings: a form number "10 18" must not be read
+  # as 1018, and "SC 00 01" must not be case-folded into a number.
+  identifier_key_regex: "(number|naic|zip|postal|vin|license|code|account|territory|sequence|certificate|identifier|marker|edition|form_|_key$|_id$|_no$)"
+  date_key_regex: "(date|dated|expiry|expiration|effective|inception|birth|printed_on|issued)"
+  absent_strings: ["", "n/a", "na", "none", "null", "-", "--", "nil",
+                   "not stated", "not provided"]
+  # Facts about the EXTRACTION rather than about the document. A model cannot
+  # produce these truthfully, so scoring them docks every cell equally for
+  # something that says nothing about extraction quality.
+  # Judgement fields (unresolved_fields, validation_flags) are deliberately NOT
+  # ignored: those are real observations about the document, and a model failing
+  # to make them is a finding worth reporting rather than noise worth hiding.
+  ignore_paths:
+    - extraction_meta.schema_version
+    - extraction_meta.source_file
+  coverage_report: true
+  strict_score: true
+
+report:
+  formats: [json, md, csv]
+  top_missing_fields: 40
+  baseline_cell: "7B/pdf_only"  # the cell every delta is measured against
+
+runtime:
+  mock: false
+  mock_profile: degraded       # perfect | degraded | truncated | garbage
+  overwrite: false             # false = skip a cell that already has output (resume)
+  fail_fast: false
+  log_level: INFO

@@ -1,0 +1,5 @@
+Document Type: {{DOCTYPE_NAME}}
+
+You have two synchronized views of the same document: the page images, and the MinerU-extracted markdown for each of those pages, given together page by page below.
+
+Cross-reference the spatial layout from the images against the textual stream from the markdown. Extract every value the schema provides for and emit a single raw JSON object conforming to the schema. No markdown wrapping.

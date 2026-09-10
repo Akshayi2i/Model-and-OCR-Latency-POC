@@ -1,0 +1,14 @@
+Document Type: Business Owner's Policy Declarations
+Schema Reference: schema.json
+
+You have:
+1. The attached page images / PDF document.
+2. The MinerU-extracted Markdown text representing the OCR/text layer below.
+
+--- MINERU MARKDOWN START ---
+{{MINERU_MARKDOWN_CONTENT}}
+--- MINERU MARKDOWN END ---
+
+Cross-reference the spatial layout from the images with the textual stream from the Markdown. Extract all policy metadata, locations, coverage schedules, attached forms, and statutory fees/premiums.
+
+Emit the result as a single raw JSON object matching `schema.json` without markdown wrapping.

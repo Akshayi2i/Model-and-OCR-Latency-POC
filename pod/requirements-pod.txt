@@ -1,0 +1,28 @@
+# ============================================================================
+# RunPod pod only (Linux, CUDA). NOT for the Windows orchestrator.
+#
+# One environment serves BOTH model architectures:
+#   Qwen2.5-VL -> Qwen2_5_VLForConditionalGeneration  (vLLM since 0.7.x)
+#   Qwen3-VL   -> Qwen3VLForConditionalGeneration     (vLLM 0.11+, transformers 4.57+)
+# The version floor below is what makes a single install cover both, and
+# setup_pod.sh asserts it BEFORE downloading 33 GB of weights.
+# ============================================================================
+
+vllm>=0.11.0
+transformers>=4.57.0
+
+# MinerU OCR service on :8002.
+# 2.1.10 is BROKEN: it loads en_PP-OCRv3_det_infer.pth from
+# opendatalab/PDF-Extract-Kit-1.0, and that repo dropped the v3 detection weights
+# for v5/v6. MinerU then exits 0 having written nothing. A pinned library does not
+# pin the models it downloads at runtime, which is why setup_pod.sh pre-downloads
+# them and /health reports models_ready.
+# [pipeline] only: [core] also drags in the unused Gradio UI.
+mineru[pipeline]==2.7.6
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pymupdf>=1.26.0
+huggingface-hub>=0.34
+hf_transfer>=0.1.9

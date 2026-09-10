@@ -1,0 +1,5 @@
+Document Type: {{DOCTYPE_NAME}}
+
+Below is the MinerU-extracted markdown for each page of the document, in reading order. There are no images.
+
+Extract every value the schema provides for and emit a single raw JSON object conforming to the schema. No markdown wrapping.

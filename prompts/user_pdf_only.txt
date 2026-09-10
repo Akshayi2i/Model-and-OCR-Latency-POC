@@ -1,0 +1,5 @@
+Document Type: {{DOCTYPE_NAME}}
+
+Attached are the page images of the document, in reading order.
+
+Extract every value the schema provides for and emit a single raw JSON object conforming to the schema. No markdown wrapping.

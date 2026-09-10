@@ -1,0 +1,15 @@
+# ============================================================================
+# LOCAL orchestrator only (Windows workstation).
+#
+# There is deliberately NO torch, NO vllm, NO transformers and NO mineru here.
+# All model execution happens on the RunPod pod behind an HTTP boundary; this
+# machine renders pages, builds prompts, streams requests, parses JSON and
+# scores the results. See pod/requirements-pod.txt for the GPU side.
+#
+#   pip install -r requirements.txt
+# ============================================================================
+
+pyyaml>=6.0.2
+requests>=2.32.3
+pymupdf>=1.26.0          # page rendering + JPEG wire encoding + no-OCR fallback text
+jsonschema>=4.25.0       # validates the extraction against input/schema.json

@@ -1,0 +1,29 @@
+### DOCUMENT TYPE: POLICY DECLARATIONS
+
+You are reading a policy declarations page, endorsement summary or change declaration - personal or commercial lines. It states what is covered, for whom, for how long, at what limits, and for what premium. It is a summary of contract terms, not the policy contract itself.
+
+Expect these blocks, in roughly this order, though many documents omit some:
+- Carrier identity, and whether this is a new policy, a renewal, or a change/endorsement to an existing one.
+- Policy identifiers: policy number, quote number, prior or replaced policy number, NAIC, agency code, customer id.
+- Dates: inception, effective, expiration, process/print date, and for a change, the change effective date. These are distinct dates and must not be collapsed into one another.
+- Named insured(s) and mailing address; the agency/producer block with its own address and phone. These sit side by side and are routinely swapped by a linear text reader - the insured is the customer, the agency is the seller.
+- Scheduled locations, premises, buildings, vehicles or watercraft, each usually numbered.
+- One or more coverage schedules: a coverage name per row, with limit, deductible and premium columns.
+- A forms and endorsements list: form number, edition, title, and often a premium of its own.
+- Premium totals, fees, surcharges and taxes.
+
+### WHAT THIS DOCUMENT TYPE GETS WRONG MOST OFTEN
+
+1. Column ownership. A coverage schedule may carry limit, deductible and premium columns where a given row fills only some of them. Read down the column rules, not across the visual gap: a figure sitting under DEDUCTIBLE is a deductible even when the LIMIT cell beside it is empty. Never shift a value into a neighbouring column to fill a hole.
+
+2. Per-item coverage matrices. An auto or watercraft schedule may print coverages as rows against numbered items as columns, with only the first column populated. Every value belongs to the item whose column it sits under. Do not attribute a value to an item that has no entry in that row.
+
+3. Values that are not amounts. Coverage cells legitimately contain words rather than money: a coverage may be shown as included, as covered at no additional charge, as declined, as not applicable, or by a printed placeholder of repeated symbols standing for "no separate limit applies". Record what is printed. Do not convert such a cell to zero, and do not treat it as an absent value.
+
+4. Credits and returns. A premium may be negative, shown either with a leading minus or wrapped in parentheses. Both mean a credit. Preserve the sign; a return premium recorded as a positive charge inverts the document's meaning.
+
+5. Continuation. A schedule or forms list may be cut off with a note that it continues on the following page. The continued rows belong to the same schedule, not to a new one. Merge them.
+
+6. Grouped sections. Coverages are often banded into sections such as property, liability and optional items. Keep each coverage under the section it is printed within.
+
+7. Page furniture. A document exported through a browser or viewer carries a print timestamp, a page URL and a viewer title in its margins. These are artefacts of printing, not policy data, and must never be extracted as document content.

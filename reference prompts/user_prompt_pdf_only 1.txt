@@ -1,0 +1,6 @@
+Document Type: Business Owner's Policy Declarations
+Schema Reference: schema.json
+
+Attached are the document page images. 
+
+Extract all policy identifiers, scheduled premises, coverage sections, attached forms, and statutory charges/premiums from these pages. Validate and format the extracted content directly into a single JSON object conforming strictly to schema.json.

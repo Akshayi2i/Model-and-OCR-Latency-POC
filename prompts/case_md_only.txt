@@ -1,0 +1,3 @@
+You receive no images. You receive only the OCR text of each page, in reading order, each preceded by a header line naming its position in the file. This text is your only source: extract solely from it and never invent a value that is not present in it.
+
+The OCR is layout-aware markdown, but table structure may be flattened and a column may be misaligned. When a table's alignment is ambiguous, rely on the printed row and column labels rather than on position. If a value's owning column genuinely cannot be determined from the text, record it where its own label says it belongs rather than guessing a column.
