@@ -1,11 +1,8 @@
 # ============================================================================
 # RunPod pod only (Linux, CUDA). NOT for the Windows orchestrator.
 #
-# One environment serves BOTH model architectures:
-#   Qwen2.5-VL -> Qwen2_5_VLForConditionalGeneration  (vLLM since 0.7.x)
-#   Qwen3-VL   -> Qwen3VLForConditionalGeneration     (vLLM 0.11+, transformers 4.57+)
-# The version floor below is what makes a single install cover both, and
-# setup_pod.sh asserts it BEFORE downloading 33 GB of weights.
+# Qwen3-VL -> Qwen3VLForConditionalGeneration needs vLLM 0.11+ and transformers
+# 4.57+. setup_pod.sh asserts that floor BEFORE downloading 17 GB of weights.
 # ============================================================================
 
 vllm>=0.11.0

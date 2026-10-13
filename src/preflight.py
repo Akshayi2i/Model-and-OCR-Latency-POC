@@ -1,12 +1,14 @@
 """Go/no-go checks. Run these before spending GPU time.
 
-    python src/preflight.py --local     inputs, render, budgets. No network.
-    python src/preflight.py --pod       both vLLM ports + MinerU. Seconds of GPU.
+    python src/preflight.py --local     inputs, schemas, render, budgets. No network.
+    python src/preflight.py --pod       the vLLM port + MinerU. Seconds of GPU.
     python src/preflight.py --all
 
---local answers: did it find the right PDF, schema and gold; do the pages render
-inside the cap; how big is each request; will each cell fit the context window.
---pod answers: are both models actually serving under the names config expects;
+--local answers: did it find every LOB folder, the right PDF and gold, and did
+the common + LOB schemas resolve into a valid schema the gold conforms to; do the
+pages render inside the cap; how is each document split into windows; will the
+largest window of each case fit the context window.
+--pod answers: is the model actually serving under the name config expects;
 does streaming really stream through the proxy (rather than being buffered into
 one lump, which would reinstate the 100s timeout); is MinerU's model download
 present.
@@ -77,7 +79,7 @@ def leaked_gold_values(cfg: dict, schema: dict, gold: dict,
                        doc_type: str = "") -> dict:
     """Distinctive gold answers that appear verbatim in the prompt text.
 
-    An example baked into the prompt is shown to all six cells, so a real answer
+    An example baked into the prompt is shown to every case, so a real answer
     used as an illustration is an answer handed to every model for free - and it
     inflates exactly the fields it illustrates. Enum members and key names are
     excluded: those are schema vocabulary the model is meant to have.
@@ -91,7 +93,7 @@ def leaked_gold_values(cfg: dict, schema: dict, gold: dict,
       schema   - an "e.g." inside a description the schema author wrote. That is
                  the schema owner's call: the descriptions are real guidance a
                  production extractor would also ship with, and the effect falls
-                 on all six cells equally, so the model COMPARISON is unaffected
+                 on every case equally, so the case COMPARISON is unaffected
                  even though the absolute scores are slightly flattered.
     """
     vocab = _schema_vocabulary(schema)
@@ -161,22 +163,63 @@ def check_local(cfg: dict, ck: Checks) -> dict:
         ck.add(BAD, "input dir", f"{input_dir} does not exist")
         return {}
 
+    lob = common.lob_mode(cfg)
+    if lob:
+        cs = (cfg.get("paths") or {}).get("common_schema")
+        cpath = common.cfg_path(cfg, "common_schema") if cs else None
+        if cpath is None:
+            ck.add(WARN, "common schema", "paths.common_schema is null - each LOB "
+                                          "schema is used on its own")
+        elif not cpath.exists():
+            ck.add(WARN, "common schema", f"{cpath} not found - each LOB schema is "
+                                          f"used on its own until it is in place")
+        else:
+            ck.add(OK, "common schema", str(cpath.relative_to(common.ROOT))
+                   if cpath.is_relative_to(common.ROOT) else str(cpath))
+
     docs, unpaired, orphan_golds = common.discover_documents(
         cfg, tuple((cfg.get("corpus") or {}).get("gold_suffixes")
                    or common.DEFAULT_GOLD_SUFFIXES))
     if not docs:
         ck.add(BAD, "documents",
-               f"no PDF found under {input_dir}. Expected one folder per doc type: "
-               + ", ".join(str(d.get("dir")) for d in common.doc_type_specs(cfg)))
+               f"no PDF found under {input_dir}. Expected one folder per "
+               + ("line of business, each holding its schema, PDFs and gold JSONs"
+                  if lob else "doc type: " + ", ".join(
+                      str(d.get("dir")) for d in common.doc_type_specs(cfg))))
         return {}
 
     by_type: dict = {}
     for d in docs:
         by_type.setdefault(d.doc_type, []).append(d)
     for tid, group in by_type.items():
-        ck.add(OK, f"doc type {tid}",
-               f"{len(group)} document(s) in input/{common.doc_type_dir_name(cfg, tid)}/, "
-               f"prompt={Path(str(common.doc_type_spec(cfg, tid).get('prompt'))).name}")
+        spec = common.doc_type_spec(cfg, tid)
+        prompts = [Path(str(spec.get("prompt"))).name]
+        if spec.get("lob_prompt") and common.resolve(spec["lob_prompt"]).exists():
+            prompts.append(Path(spec["lob_prompt"]).name)
+        ck.add(OK, f"{'LOB' if lob else 'doc type'} {tid}",
+               f"{len(group)} document(s) in {input_dir.name}/{common.doc_type_dir_name(cfg, tid)}/, "
+               f"prompt={'+'.join(prompts)}")
+        if lob:
+            # What THIS discovery found - never a notes file left by an earlier run.
+            import schema_resolver
+            for err in schema_resolver.ERRORS.get(tid, []):
+                ck.add(BAD, f"schema {tid}", f"could not resolve: {err}")
+            for resolved in sorted({d.schema for d in group if d.schema}, key=str):
+                notes = schema_resolver.load_notes(resolved)
+                how = "; ".join(notes.get("mode") or []) or "LOB schema used as written"
+                common_only = not notes.get("lob")
+                ck.add(WARN if common_only else OK, f"resolved schema {tid}",
+                       f"{resolved.name}: {len(notes.get('top_level_fields') or [])} "
+                       f"top-level fields (common {len(notes.get('common_fields') or [])}, "
+                       f"LOB-only {len(notes.get('lob_fields') or [])}); {how}"
+                       + ("  <- no LOB schema found: only the COMMON fields will be "
+                          "extracted for this LOB" if common_only else ""))
+                if notes.get("clashes"):
+                    ck.add(WARN, f"schema clashes {tid}",
+                           f"{len(notes['clashes'])} field definition(s) differ between "
+                           f"common and LOB; the LOB's was kept: "
+                           + ", ".join(c["path"] for c in notes["clashes"][:5])
+                           + f"  (all in {schema_resolver.notes_path_for(resolved).name})")
 
     schemas: dict = {}
     for d in docs:
@@ -269,14 +312,14 @@ def check_local(cfg: dict, ck: Checks) -> dict:
                    f"{len(leaked['schema'])} example(s) in the schema's own "
                    f"description text are real answers here, making {hits} of "
                    f"{total} scored leaves ({hits / total:.1%}) answerable from the "
-                   f"prompt. All six cells get them equally, so the model COMPARISON "
+                   f"prompt. Every case gets them equally, so the case COMPARISON "
                    f"holds; the absolute scores are flattered by up to that much. "
                    f"Worst: " + ", ".join(repr(v) for v in leaked["schema"][:4]))
 
     print("\n=== prompt and budget " + "=" * 47)
     # One span per DOCUMENT: each carries its own schema, so spans differ between
-    # documents by design. What must hold is that one document's six cells share
-    # one span, which is guaranteed here by construction and re-checked in the
+    # documents by design. What must hold is that one document's cases share one
+    # span, which is guaranteed here by construction and re-checked in the
     # report against what was actually sent.
     for d in docs:
         if d.doc_id not in schemas:
@@ -284,66 +327,119 @@ def check_local(cfg: dict, ck: Checks) -> dict:
         shared = prompting.shared_prompt_span(cfg, schemas[d.doc_id], d.doc_type)
         ck.add(OK, f"shared prompt span  {d.doc_type}/{d.doc_id}",
                f"sha={common.sha256_text(shared)[:16]}  {len(shared):,} chars "
-               f"(one span for this document's six cells)")
+               f"(one span for all of this document's cases and windows)")
 
-    fps: dict[str, str] = {}
+    # Budget per WINDOW: that is what one request carries - its pages, the
+    # reference pages and room for the digest of earlier windows. The worst
+    # window of each case is the one that has to fit.
+    import chunking
+    import runner
+    ch = cfg.get("chunking") or {}
+    ctx_cfg = ch.get("context") or {}
+    inf = cfg.get("inference") or {}
+    fps: dict[str, dict[str, str]] = {}
     for d in docs:
         if d.doc_id not in schemas:
             continue
         schema = schemas[d.doc_id]
         ocr_dir = common.ocr_dir_for(cfg, d.doc_id)
-        print(f"\n  {d.doc_id}")
-        print(f"    {'cell':16} {'imgs':>5} {'payload MB':>11} {'prompt tok':>11} "
-              f"{'+out':>8} {'ctx':>8} {'use':>6}")
+        wins, how = chunking.plan_for_document(cfg, ocr_dir, d.n_pages)
+        anchors = [int(a) for a in (ctx_cfg.get("anchor_pages") or []) if 1 <= int(a) <= d.n_pages]
+        carry = bool(ctx_cfg.get("carry_forward")) and len(wins) > 1
+        reserve = int(ctx_cfg.get("digest_max_chars", 6000)) if carry else 0
+        gold = common.read_json(d.gold) if d.gold else None
+        budget = runner.output_budget(cfg, gold, _Quiet()) or int(inf.get("max_tokens", 8192))
+        print(f"\n  {d.doc_id}: {d.n_pages} pages -> {len(wins)} window(s) "
+              f"{', '.join(f'{a}-{b}' for a, b in wins[:8])}{' ...' if len(wins) > 8 else ''}"
+              f" ({how}); reference pages {anchors if len(wins) > 1 else 'none'}; "
+              f"digest {'<= ' + format(reserve, ',') + ' chars' if carry else 'off'}; "
+              f"output budget {budget:,} tokens")
+        if (ch.get("section_boundaries") or {}).get("enabled") and how.startswith("fixed") \
+                and len(wins) > 1:
+            print("    (window boundaries will be re-planned at section starts once MinerU "
+                  "markdown exists - this is the fixed plan)")
+        print(f"    {'cell (worst window)':22} {'imgs':>5} {'payload MB':>11} "
+              f"{'prompt tok':>11} {'+out':>8} {'ctx':>8} {'use':>6}")
         for m in cfg.get("models", []):
+            ctx = int(m.get("max_model_len", 65536))
             for case in cfg.get("cases", prompting.CASES):
                 needs = prompting.CASE_NEEDS[case]
+                label = f"{m['tag']}/{case}"
                 try:
                     pages = render.require_pages(ocr_dir, case, needs["png"], needs["md"])
                 except FileNotFoundError:
-                    print(f"    {m['tag'] + '/' + case:16} "
-                          f"{'-- markdown not fetched yet --':>50}")
+                    print(f"    {label:22} {'-- markdown not fetched yet --':>50}")
                     continue
-                msgs = prompting.build_messages(cfg, case, pages, schema, d.doc_type)
-                fps[f"{m['tag']}/{case}"] = prompting.conversation_fingerprint(msgs)
-                try:
-                    _wire, stats = prompting.materialize(msgs, cfg)
-                except prompting.PayloadTooLarge as exc:
-                    ck.add(BAD, f"payload {m['tag']}/{case}", str(exc))
+                by_index = {p.index: p for p in pages}
+                worst = None
+                for i, (first, last) in enumerate(wins, 1):
+                    wpages = [by_index[k] for k in range(first, last + 1) if k in by_index]
+                    refs = ([by_index[a] for a in anchors if not first <= a <= last
+                             and a in by_index] if len(wins) > 1 else [])
+                    msgs = prompting.build_messages(cfg, case, wpages, schema, d.doc_type,
+                                                    total_pages=d.n_pages, reference_pages=refs)
+                    if i == 1:
+                        fps.setdefault(d.doc_id, {})[label] = \
+                            prompting.conversation_fingerprint(msgs)
+                    try:
+                        _wire, stats = prompting.materialize(msgs, cfg)
+                    except prompting.PayloadTooLarge as exc:
+                        ck.add(BAD, f"payload {d.doc_id} {label} window {first}-{last}", str(exc))
+                        continue
+                    est = prompting.estimate_tokens(msgs, wpages + refs, case, budget,
+                                                    reserve if i > 1 else 0)
+                    if worst is None or est["total_tokens_est"] > worst[1]["total_tokens_est"]:
+                        worst = (stats, est, (first, last))
+                    if stats["n_images"] > int(m.get("max_images", 24)):
+                        ck.add(BAD, f"images {d.doc_id} {label}",
+                               f"window {first}-{last} sends {stats['n_images']} images, over "
+                               f"models[].max_images {m.get('max_images')} - lower "
+                               f"chunking.window_pages")
+                if worst is None:
                     continue
-                est = prompting.estimate_tokens(
-                    msgs, pages, case,
-                    int((cfg.get("inference") or {}).get("max_tokens", 8192)))
-                ctx = int(m.get("max_model_len", 65536))
+                stats, est, (first, last) = worst
                 use = est["total_tokens_est"] / ctx
-                print(f"    {m['tag'] + '/' + case:16} {stats['n_images']:5d} "
+                print(f"    {label + f' p{first}-{last}':22} {stats['n_images']:5d} "
                       f"{stats['payload_mb']:11.2f} {est['prompt_tokens_est']:11,d} "
                       f"{est['max_tokens']:8,d} {ctx:8,d} {use:5.0%}")
                 if use > 0.85:
-                    ck.add(BAD, f"budget {m['tag']}/{case}",
-                           f"~{est['total_tokens_est']:,} of {ctx:,} tokens ({use:.0%}). "
-                           f"Lower render.max_long_side_px (1024->896->768) or "
-                           f"prompt.max_md_chars_per_page, or raise --max-model-len "
-                           f"and drop --gpu-memory-utilization to match.")
+                    ck.add(BAD, f"budget {d.doc_id} {label}",
+                           f"~{est['total_tokens_est']:,} of {ctx:,} tokens ({use:.0%}) in "
+                           f"window {first}-{last}. Lower chunking.window_pages, "
+                           f"render.max_long_side_px or prompt.max_md_chars_per_page, "
+                           f"or raise --max-model-len with models[].max_model_len.")
                 elif use > 0.7:
-                    ck.add(WARN, f"budget {m['tag']}/{case}",
-                           f"~{use:.0%} of the context window")
+                    ck.add(WARN, f"budget {d.doc_id} {label}",
+                           f"~{use:.0%} of the context window in window {first}-{last}")
 
-    if fps:
+    models = cfg.get("models", [])
+    same_within, distinct_across = True, True
+    for doc_id, by_label in fps.items():
         by_case: dict[str, set] = {}
-        for label, fp in fps.items():
+        for label, fp in by_label.items():
             by_case.setdefault(label.split("/", 1)[1], set()).add(fp)
-        same_within = all(len(v) == 1 for v in by_case.values())
-        distinct_across = len({next(iter(v)) for v in by_case.values() if len(v) == 1}) \
-            == len([v for v in by_case.values() if len(v) == 1])
-        ck.add(OK if same_within else BAD, "same input to both models",
-               "each case sends byte-identical content to 7B and 8B"
-               if same_within else "a case differs between models")
+        same_within &= all(len(v) == 1 for v in by_case.values())
+        singles = [next(iter(v)) for v in by_case.values() if len(v) == 1]
+        distinct_across &= len(set(singles)) == len(singles)
+    if fps:
+        if len(models) > 1:
+            ck.add(OK if same_within else BAD, "same input to every model",
+                   "each case sends byte-identical content to every model"
+                   if same_within else "a case differs between models")
         ck.add(OK if distinct_across else BAD, "cases differ from each other",
                "no two cases send the same content" if distinct_across
                else "two cases produced the same fingerprint")
 
     return per_doc
+
+
+class _Quiet:
+    """A logger stand-in for helpers that warn; preflight reports on its own."""
+
+    def warning(self, *_a, **_k) -> None:
+        pass
+
+    info = debug = warning
 
 
 def check_pod(cfg: dict, ck: Checks) -> None:
@@ -365,13 +461,34 @@ def check_pod(cfg: dict, ck: Checks) -> None:
     inf = dict(cfg.get("inference") or {})
     for m in cfg.get("models", []):
         tag, port = str(m["tag"]), int(m["port"])
-        base = common.base_url_for(cfg, port)
+        base = common.base_url_for(cfg, port, m.get("base_url"))
         client = VLLMClient(base, str(m.get("served_name") or m["model_id"]),
                             pod.get("api_key"), inf, bool(pod.get("verify_tls", True)))
         ok, detail = client.health()
         ck.add(OK if ok else BAD, f"{tag} :{port}", detail)
         if not ok:
             continue
+
+        # vLLM reports the context it was started with. A window that does not
+        # fit is refused with a 400 after its images were uploaded - so a server
+        # running a smaller context than config.yaml plans for is a NO-GO here.
+        try:
+            import requests
+            r = requests.get(client._url("/models"), headers=client._headers(), timeout=30,
+                             verify=bool(pod.get("verify_tls", True)))
+            served = next((d for d in r.json().get("data") or []
+                           if d.get("id") == client.model), {})
+            served_len = served.get("max_model_len")
+            want = int(m.get("max_model_len", 0))
+            if served_len is not None and served_len < want:
+                ck.add(BAD, f"{tag} context",
+                       f"server runs max_model_len={served_len:,} but config plans for "
+                       f"{want:,}. Raise it on the pod (serve.conf VL_LEN={want}, and "
+                       f"VL_UTIL ~0.62 so the KV cache holds it) and restart vLLM.")
+            elif served_len is not None:
+                ck.add(OK, f"{tag} context", f"max_model_len={served_len:,}")
+        except Exception as exc:  # noqa: BLE001 - informational
+            ck.add(WARN, f"{tag} context", f"could not read max_model_len: {exc}")
 
         # A real streaming call. Two things are being proven: time-to-first-byte
         # is inside the budget, and MULTIPLE chunks actually arrive. If the proxy
@@ -398,9 +515,29 @@ def check_pod(cfg: dict, ck: Checks) -> None:
             ck.add(WARN, f"{tag} usage", "no usage block - set stream_options.include_usage")
 
     ocr_cfg = cfg.get("ocr") or {}
-    if str(ocr_cfg.get("mode", "pod")).lower() == "pod":
+    if str(ocr_cfg.get("mode", "pod")).lower() == "mineru_api":
+        port = int(ocr_cfg.get("port", 8001))
+        mc = ocr_client.MinerUApiClient(
+            common.base_url_for(cfg, port, ocr_cfg.get("base_url")),
+            pod.get("ocr_api_key"), ocr_cfg, bool(pod.get("verify_tls", True)))
+        try:
+            h = mc.health()
+            tiers = mc.tiers()
+        except Exception as exc:  # noqa: BLE001
+            ck.add(BAD, f"MinerU :{port}", f"{type(exc).__name__}: {exc}")
+            return
+        ck.add(OK if h.get("status") == "ok" else BAD, f"MinerU :{port}",
+               f"mineru-api {h.get('version')} status={h.get('status')}, "
+               f"output formats {((h.get('features') or {}).get('output_formats'))}")
+        if "structured_content" not in ((h.get("features") or {}).get("output_formats") or []):
+            ck.add(BAD, "MinerU structured_content",
+                   "this server does not offer structured_content - per-page text cannot "
+                   "be attributed to pages")
+        ck.add(OK if mc.tier in tiers else BAD, "MinerU tier",
+               f"ocr.tier={mc.tier!r}; server offers {tiers}")
+    elif str(ocr_cfg.get("mode", "pod")).lower() == "pod":
         port = int(ocr_cfg.get("port", 8002))
-        mc = ocr_client.MinerUClient(common.base_url_for(cfg, port),
+        mc = ocr_client.MinerUClient(common.base_url_for(cfg, port, ocr_cfg.get("base_url")),
                                      pod.get("ocr_api_key"), ocr_cfg,
                                      bool(pod.get("verify_tls", True)))
         try:
@@ -409,8 +546,13 @@ def check_pod(cfg: dict, ck: Checks) -> None:
             ck.add(BAD, f"MinerU :{port}", f"{type(exc).__name__}: {exc}")
             return
         ck.add(OK, f"MinerU :{port}",
-               f"{h.get('mineru_version')} on {h.get('device')}, "
-               f"free VRAM {h.get('free_vram_gb')} GB")
+               f"{h.get('mineru_version')} on {h.get('device')}"
+               + (f" ({h['gpu']})" if h.get("gpu") else "")
+               + f", free VRAM {h.get('free_vram_gb')} GB")
+        if "gpu" not in h:
+            ck.add(WARN, "MinerU server version",
+                   "the pod runs the older mineru_server.py: MinerU timing will have "
+                   "no queue/CLI breakdown. Copy the current pod/ folder and restart it.")
         if h.get("models_ready"):
             ck.add(OK, "MinerU models", "weights present")
         else:

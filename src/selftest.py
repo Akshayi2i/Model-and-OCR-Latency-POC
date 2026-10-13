@@ -199,7 +199,10 @@ def first_repeated_leaf(gold: dict, sspec: scoring.ScoreSpec) -> str | None:
     counts: dict = {}
     lc: dict = {}
     scoring.tally(gold, gold, counts, "", sspec, lc)
-    inside_list = [f for f, c in counts.items() if c[1] >= 2 and "[]" in f]
+    # A named field only: drop_field removes keys, so an element of a plain-value
+    # list ('applies_to[0]') cannot be dropped and would read as a scorer failure.
+    inside_list = [f for f, c in counts.items()
+                   if c[1] >= 2 and "[]" in f and not f.endswith("]")]
     return sorted(inside_list, key=lambda f: (-counts[f][1], f))[0] if inside_list else None
 
 
@@ -304,11 +307,19 @@ def run(gold: dict, cfg: dict) -> int:
         verdict(False)
     else:
         r5 = scoring.score_document(gold, parsed, cfg)
+        # Judged over EVERYTHING scored - field_f1 plus the separately scored
+        # parts - because the cut may fall entirely inside a separate section
+        # (a long text_sections index at the end), leaving field_f1 untouched.
+        parts = [(r5["matched_leaves"], r5["gold_leaves"], r5["pred_leaves"])] + [
+            (s["matched_leaves"], s["gold_leaves"], s.get("pred_leaves", s["matched_leaves"]))
+            for s in (r5.get("separate") or {}).values()]
+        m, g, p = (sum(x[i] for x in parts) for i in range(3))
+        recall, precision = (m / g if g else 1.0), (m / p if p else 1.0)
         print(f"    {reason}")
-        print(f"    recovered f1={r5['field_f1']:.3f}  recall={r5['field_recall']:.3f}  "
-              f"precision={r5['field_precision']:.3f}")
+        print(f"    recovered field_f1={r5['field_f1']:.3f}; over everything scored "
+              f"recall={recall:.3f} precision={precision:.3f}")
         print("    (a floor, not a measurement -- json_valid_strict is False here)")
-        verdict(repaired and 0.0 < r5["field_recall"] < 1.0 and r5["field_precision"] >= 0.99,
+        verdict(repaired and 0.0 < recall < 1.0 and precision >= 0.99,
                 "repair must recover a partial PREFIX, inventing nothing")
 
     print("\n" + "=" * 70)

@@ -64,16 +64,39 @@ DEFAULT_DATE_RE = r"(date|dated|expiry|expiration|effective|inception|birth|prin
 class NormOpts:
     """Everything normalisation needs, resolved once from config."""
 
-    __slots__ = ("absent", "id_re", "date_re")
+    __slots__ = ("absent", "id_re", "date_re", "value_keys")
 
     def __init__(self, cfg: dict | None = None):
         sc = ((cfg or {}).get("scoring") or {})
         self.absent = {str(s).casefold() for s in (sc.get("absent_strings") or DEFAULT_ABSENT)}
         self.id_re = re.compile(sc.get("identifier_key_regex") or DEFAULT_IDENTIFIER_RE, re.I)
         self.date_re = re.compile(sc.get("date_key_regex") or DEFAULT_DATE_RE, re.I)
+        # An object carrying one of these keys is ONE value in a wrapper (a
+        # FieldValue {raw, parsed, confidence, page_ref}); where a single value is
+        # needed - an identity key, a digest label - the first non-null of them
+        # is used.
+        self.value_keys = tuple(str(k) for k in (sc.get("value_keys") or ("parsed", "raw")))
 
 
 DEFAULT_OPTS = NormOpts()
+
+
+def unwrap(value: Any, opts: NormOpts = DEFAULT_OPTS) -> Any:
+    """A wrapped value's own value ({raw: "X", parsed: "x", ...} -> "x"); else as is."""
+    if isinstance(value, dict) and any(k in value for k in opts.value_keys):
+        for k in opts.value_keys:
+            if value.get(k) is not None:
+                return value[k]
+        return None
+    return value
+
+
+_SEG_SUFFIX = re.compile(r"(\[\d*\])*(#count)?$")
+
+
+def segments(spec: str) -> list[str]:
+    """Field names along a spec path: 'a[].b.page_ref[0]' -> ['a', 'b', 'page_ref']."""
+    return [_SEG_SUFFIX.sub("", s) for s in str(spec).split(".") if s]
 
 
 # --------------------------------------------------------------------------- normalisation
@@ -183,7 +206,8 @@ def item_spec(spec: str) -> str:
 class ScoreSpec:
     """Which lists are entities, how to key them, and what to ignore."""
 
-    __slots__ = ("entity_lists", "auto", "ignore", "opts")
+    __slots__ = ("entity_lists", "auto", "ignore", "ignore_keys", "page_ref_keys",
+                 "separate", "keyed_maps", "opts")
 
     def __init__(self, cfg: dict | None = None):
         sc = ((cfg or {}).get("scoring") or {})
@@ -193,7 +217,27 @@ class ScoreSpec:
         }
         self.auto = bool(sc.get("auto_entity_lists", True))
         self.ignore = set(str(p) for p in (sc.get("ignore_paths") or []))
+        # Field NAMES ignored wherever they occur (confidence, flagged...).
+        self.ignore_keys = set(str(k) for k in (sc.get("ignore_keys") or []))
+        # Where a value is printed: scored separately, never part of identity.
+        self.page_ref_keys = set(str(k) for k in (sc.get("page_ref_keys") or []))
+        # Top-level sections scored separately from the main F1.
+        self.separate = [str(p) for p in (sc.get("separate_sections") or [])]
+        # Objects keyed by generated ids, scored as lists matched by content.
+        self.keyed_maps = [str(p) for p in (sc.get("keyed_maps") or [])]
         self.opts = NormOpts(cfg)
+
+    def group(self, spec: str) -> str | None:
+        """Which separate score a field belongs to; None = the main F1."""
+        for p in self.separate:
+            if spec == p or spec.startswith(p + ".") or spec.startswith(p + "["):
+                return p
+        if self.page_ref_keys and any(s in self.page_ref_keys for s in segments(spec)):
+            return "page_references"
+        return None
+
+    def is_page_ref(self, spec: str) -> bool:
+        return bool(self.page_ref_keys) and any(s in self.page_ref_keys for s in segments(spec))
 
     def is_entity_list(self, spec: str, *values: Any) -> bool:
         """Any list holding dicts is an entity list, always.
@@ -217,6 +261,8 @@ class ScoreSpec:
 
     def ignored(self, spec: str) -> bool:
         if spec in self.ignore:
+            return True
+        if self.ignore_keys and any(s in self.ignore_keys for s in segments(spec)):
             return True
         return any(spec.startswith(p + ".") or spec.startswith(p + "[]") for p in self.ignore)
 
@@ -248,7 +294,9 @@ def make_keyfuncs(key_specs: Iterable[Iterable[str]],
             parts = []
             seen_any = False
             for f in _fields:
-                v = norm_leaf(f, dig(entity, f), True, opts)
+                # A wrapped field compares by its value, never by its page_ref
+                # or confidence riding along in the wrapper.
+                v = norm_leaf(f, unwrap(dig(entity, f), opts), True, opts)
                 if v is not None:
                     seen_any = True
                 parts.append("" if v is None else str(v))
@@ -488,14 +536,24 @@ def flatten(obj: Any, prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def strict_score(gold: dict, candidate: Any, opts: NormOpts = DEFAULT_OPTS) -> dict:
+def strict_score(gold: dict, candidate: Any, opts: NormOpts = DEFAULT_OPTS,
+                 sspec: "ScoreSpec | None" = None) -> dict:
     """Index-path exact match. The harsh read, reported alongside the field F1.
 
     The GAP between this and field_f1 is the point: it says how much of the
     difference between two cells is ordering and formatting rather than content.
+    Covers the same fields as field_f1: ignored and separately scored fields
+    are left out.
     """
-    gold_flat = flatten(gold)
-    cand_flat = flatten(candidate) if isinstance(candidate, (dict, list)) else {}
+    def keep(path: str) -> bool:
+        if sspec is None:
+            return True
+        spec = re.sub(r"\[\d+\]", "[]", path)
+        return not sspec.ignored(spec) and sspec.group(spec) is None
+
+    gold_flat = {p: v for p, v in flatten(gold).items() if keep(p)}
+    cand_flat = ({p: v for p, v in flatten(candidate).items() if keep(p)}
+                 if isinstance(candidate, (dict, list)) else {})
 
     matches = 0
     for path, gold_value in gold_flat.items():
@@ -590,12 +648,42 @@ def coverage_report(ocr_text: str, extracted: Any) -> dict:
 # --------------------------------------------------------------------------- entry point
 
 
+def listify_keyed_maps(obj: Any, paths: list[str]) -> Any:
+    """Objects keyed by generated ids -> lists of their values, at the given paths.
+
+    A gold section index like {"FORM 01 23|12 Example Road|": {...}} is keyed by
+    a string the model would have to reproduce character for character. As a list
+    its entries are matched by content, like any other entity list.
+    """
+    if not paths or not isinstance(obj, dict):
+        return obj
+    out = dict(obj)
+    for p in paths:
+        head, _, rest = p.partition(".")
+        if head not in out:
+            continue
+        if rest:
+            out[head] = listify_keyed_maps(out[head], [rest])
+        elif isinstance(out[head], dict) and all(isinstance(v, dict) for v in out[head].values()):
+            out[head] = list(out[head].values())
+    return out
+
+
 def score_document(gold: dict, pred: Any, cfg: dict | None = None,
                    ocr_text: str | None = None) -> dict:
-    """Score one prediction against one gold. The primary metric is field_f1."""
+    """Score one prediction against one gold. The primary metric is field_f1.
+
+    field_f1 covers the document's content only. Fields named in
+    scoring.ignore_keys (extraction metadata such as confidence) are not scored
+    at all; page references (scoring.page_ref_keys) and whole sections named in
+    scoring.separate_sections get their own scores under "separate", so they
+    are reported without diluting the main number.
+    """
     sspec = ScoreSpec(cfg)
     counts: Counts = {}
     list_counts: dict = {}
+    gold = listify_keyed_maps(gold, sspec.keyed_maps)
+    pred = listify_keyed_maps(pred, sspec.keyed_maps) if isinstance(pred, dict) else pred
 
     if isinstance(pred, dict):
         tally(gold, pred, counts, "", sspec, list_counts)
@@ -604,28 +692,44 @@ def score_document(gold: dict, pred: Any, cfg: dict | None = None,
         # than the cell silently vanishing from the report.
         tally(gold, {}, counts, "", sspec, list_counts)
 
-    precision, recall, f1 = overall(counts)
+    main = {f: c for f, c in counts.items() if sspec.group(f) is None}
+    separate: dict[str, dict] = {}
+    for f, c in counts.items():
+        g = sspec.group(f)
+        if g is not None:
+            separate.setdefault(g, {})[f] = c
+
+    precision, recall, f1 = overall(main)
     per_field = {
         f: {
             "matched": c[0], "gold": c[1], "pred": c[2],
             "precision": round(prf(c)[0], 4),
             "recall": round(prf(c)[1], 4),
             "f1": round(prf(c)[2], 4),
+            **({"group": sspec.group(f)} if sspec.group(f) else {}),
         }
         for f, c in sorted(counts.items())
     }
     missing = sorted(
-        (f for f, c in counts.items() if c[1] > 0 and c[0] == 0),
-        key=lambda f: (-counts[f][1], f),
+        (f for f, c in main.items() if c[1] > 0 and c[0] == 0),
+        key=lambda f: (-main[f][1], f),
     )
     result = {
         "field_precision": round(precision, 4),
         "field_recall": round(recall, 4),
         "field_f1": round(f1, 4),
-        "fields_scored": len(counts),
-        "gold_leaves": sum(c[1] for c in counts.values()),
-        "pred_leaves": sum(c[2] for c in counts.values()),
-        "matched_leaves": sum(c[0] for c in counts.values()),
+        "fields_scored": len(main),
+        "gold_leaves": sum(c[1] for c in main.values()),
+        "pred_leaves": sum(c[2] for c in main.values()),
+        "matched_leaves": sum(c[0] for c in main.values()),
+        "separate": {
+            g: {"precision": round(overall(cs)[0], 4), "recall": round(overall(cs)[1], 4),
+                "f1": round(overall(cs)[2], 4),
+                "gold_leaves": sum(c[1] for c in cs.values()),
+                "pred_leaves": sum(c[2] for c in cs.values()),
+                "matched_leaves": sum(c[0] for c in cs.values())}
+            for g, cs in sorted(separate.items())
+        },
         "list_counts": {
             k: {**v, "delta": v["pred"] - v["gold"]}
             for k, v in sorted(list_counts.items())
@@ -636,7 +740,7 @@ def score_document(gold: dict, pred: Any, cfg: dict | None = None,
 
     sc = ((cfg or {}).get("scoring") or {})
     if sc.get("strict_score", True):
-        result["strict"] = strict_score(gold, pred, sspec.opts)
+        result["strict"] = strict_score(gold, pred, sspec.opts, sspec)
     if sc.get("coverage_report", True) and ocr_text:
         result["coverage"] = coverage_report(ocr_text, pred)
     return result

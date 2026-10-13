@@ -27,6 +27,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 log = logging.getLogger("mineru_ocr")
@@ -108,14 +109,23 @@ def mineru_version() -> str:
 
 def run_mineru(pdf: Path, n_pages: int, backend: str = "pipeline", lang: str = "en",
                device: str | None = None, keep_discarded: bool = True,
-               progress_cb=None) -> list[str]:
-    """Run MinerU on one PDF and return one markdown string per page."""
+               progress_cb=None, timing: dict | None = None) -> list[str]:
+    """Run MinerU on one PDF and return one markdown string per page.
+
+    `timing`, if given, is filled with where the time went:
+      cli_s    - the MinerU subprocess, start to exit. Includes MinerU's own
+                 start-up and model load, which it pays on EVERY run because each
+                 run is a fresh process; the report separates that fixed cost
+                 from the per-page cost by fitting time against page count.
+      parse_s  - rebuilding per-page markdown from content_list.json.
+    """
     exe = shutil.which("mineru") or shutil.which("magic-pdf")
     if not exe:
         raise RuntimeError(
             "MinerU CLI not found on PATH. Install it with "
             "pip install 'mineru[pipeline]==2.7.6'"
         )
+    timing = timing if timing is not None else {}
 
     with tempfile.TemporaryDirectory(prefix="mineru_") as tmp:
         tmp_dir = Path(tmp)
@@ -125,7 +135,10 @@ def run_mineru(pdf: Path, n_pages: int, backend: str = "pipeline", lang: str = "
         log.info("running: %s", " ".join(cmd))
         if progress_cb:
             progress_cb(0, n_pages)
+        t_cli = time.perf_counter()
         proc = subprocess.run(cmd, capture_output=True, text=True)
+        timing["cli_s"] = round(time.perf_counter() - t_cli, 3)
+        timing["device"] = dev
 
         if proc.returncode != 0:
             log.error("MinerU stdout:\n%s", proc.stdout[-4000:])
@@ -150,11 +163,15 @@ def run_mineru(pdf: Path, n_pages: int, backend: str = "pipeline", lang: str = "
 
         content_lists = sorted(tmp_dir.rglob("*_content_list.json"))
         if content_lists:
+            t_parse = time.perf_counter()
             items = json.loads(content_lists[0].read_text(encoding="utf-8"))
             log.info("parsed %s (%d blocks)", content_lists[0].name, len(items))
             if progress_cb:
                 progress_cb(n_pages, n_pages)
-            return md_from_content_list(items, n_pages, keep_discarded)
+            pages = md_from_content_list(items, n_pages, keep_discarded)
+            timing["parse_s"] = round(time.perf_counter() - t_parse, 3)
+            timing["n_blocks"] = len(items)
+            return pages
 
         markdowns = sorted(tmp_dir.rglob("*.md"))
         if not markdowns:

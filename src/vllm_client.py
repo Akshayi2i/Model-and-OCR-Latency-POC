@@ -1,4 +1,4 @@
-"""Streaming OpenAI-compatible client for the two vLLM servers on the pod.
+"""Streaming OpenAI-compatible client for the vLLM server on the pod.
 
 STREAMING IS NOT OPTIONAL HERE. The RunPod proxy terminates any request that
 produces no bytes for roughly 100 seconds, and a 15-page multimodal prefill alone
@@ -46,6 +46,25 @@ class ChatResult:
     partial: bool = False
     attempts: int = 1
     max_tokens_used: int | None = None
+    # Latency is reported per attempt AND in total. total_s/first_byte_s above
+    # describe the attempt whose text is kept; wall_s is the whole call
+    # including failed attempts, the 1.5x length retry and retry backoff - the
+    # number a caller actually waited.
+    wall_s: float = 0.0
+    attempt_log: list = field(default_factory=list)
+
+    @property
+    def decode_s(self) -> float | None:
+        if self.first_byte_s is None:
+            return None
+        return round(max(0.0, self.total_s - self.first_byte_s), 3)
+
+    @property
+    def cached_tokens(self) -> int | None:
+        """Prompt tokens served from vLLM's prefix cache, when the server reports
+        them (vllm serve --enable-prompt-tokens-details)."""
+        details = (self.usage or {}).get("prompt_tokens_details") or {}
+        return details.get("cached_tokens")
 
     @property
     def ok(self) -> bool:
@@ -220,6 +239,14 @@ class VLLMClient:
         retries = int(inf.get("retries", 2))
         backoff = float(inf.get("retry_backoff_s", 10))
 
+        t_start = time.monotonic()
+        log: list[dict] = []
+
+        def done(res: ChatResult) -> ChatResult:
+            res.attempt_log = log
+            res.wall_s = round(time.monotonic() - t_start, 3)
+            return res
+
         attempt = 0
         last: ChatResult | None = None
         while attempt <= retries:
@@ -227,6 +254,20 @@ class VLLMClient:
             res = self._stream_once(messages, budget)
             res.attempts = attempt
             last = res
+            log.append({
+                "attempt": attempt,
+                "max_tokens": budget,
+                "first_byte_s": res.first_byte_s,
+                "total_s": res.total_s,
+                "decode_s": res.decode_s,
+                "prompt_tokens": (res.usage or {}).get("prompt_tokens"),
+                "completion_tokens": (res.usage or {}).get("completion_tokens"),
+                "cached_tokens": res.cached_tokens,
+                "finish_reason": res.finish_reason,
+                "http_status": res.http_status,
+                "error": res.error,
+                "chars": len(res.text or ""),
+            })
 
             if res.error and res.text and on_partial:
                 on_partial(res.text, attempt)
@@ -237,16 +278,16 @@ class VLLMClient:
                         on_partial(res.text, attempt)
                     budget = int(budget * 1.5)
                     continue
-                return res
+                return done(res)
 
             # A 4xx is a request problem: a bigger budget or another try will not
             # fix a payload the server rejected.
             if res.http_status and 400 <= res.http_status < 500:
-                return res
+                return done(res)
             if attempt <= retries:
                 time.sleep(backoff)
 
-        return last or ChatResult(error="no attempt was made")
+        return done(last or ChatResult(error="no attempt was made"))
 
 
 # --------------------------------------------------------------------------- mock
@@ -335,13 +376,17 @@ class MockClient:
             text = json.dumps(self._degrade(rng), ensure_ascii=False)
             finish = "stop"
 
+        elapsed = round(time.monotonic() - t0, 3)
         return ChatResult(
             text=text,
             finish_reason=finish,
             usage={"prompt_tokens": 0, "completion_tokens": len(text) // 4,
                    "total_tokens": len(text) // 4},
             first_byte_s=0.0,
-            total_s=round(time.monotonic() - t0, 3),
+            total_s=elapsed,
             n_chunks=1,
             http_status=200,
+            wall_s=elapsed,
+            attempt_log=[{"attempt": 1, "first_byte_s": 0.0, "total_s": elapsed,
+                          "finish_reason": finish, "mock": True}],
         )

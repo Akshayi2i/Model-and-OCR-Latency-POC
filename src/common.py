@@ -152,8 +152,95 @@ def case_dir_name(cfg: dict, case: str) -> str:
     return str((cfg.get("case_dir_names") or {}).get(case, case))
 
 
+def lob_mode(cfg: dict) -> bool:
+    """True when document types are lines of business discovered from folders."""
+    return cfg.get("lobs") is not None
+
+
+def manifest_path(cfg: dict) -> Path | None:
+    """lobs.manifest, resolved - None in folder layout."""
+    rel = (cfg.get("lobs") or {}).get("manifest")
+    return resolve(rel) if rel else None
+
+
+def read_manifest(cfg: dict) -> dict:
+    """The manifest: {"documents": [{id, pdf, gold, schema, lob, ...}]}.
+
+    Entry paths are relative to the manifest's own folder. Raises with a clear
+    message when it is missing or malformed - a manifest layout without its
+    manifest has no way to know which schema a PDF belongs to.
+    """
+    p = manifest_path(cfg)
+    if p is None or not p.exists():
+        raise FileNotFoundError(f"lobs.manifest points at {p}, which does not exist")
+    try:
+        man = read_json(p)
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"{p.name} is not readable JSON: {exc}") from exc
+    docs = man.get("documents") if isinstance(man, dict) else None
+    if not isinstance(docs, list) or not docs:
+        raise ValueError(f"{p.name} has no 'documents' list")
+    for i, d in enumerate(docs):
+        missing = [k for k in ("pdf", "schema", "lob") if not d.get(k)]
+        if missing:
+            raise ValueError(f"{p.name} documents[{i}] lacks {missing}")
+    return man
+
+
+def lob_specs(cfg: dict) -> list[dict]:
+    """One spec per line of business, in name order.
+
+    Two layouts:
+      folders  - each folder directly under input_dir is one LOB (folders
+                 starting with "_" or "." are not);
+      manifest - lobs.manifest lists every document with its LOB and schema,
+                 for a flat input/<type>/{pdfs,gold,schema} layout.
+
+    The spec has the same shape as a configured doc type, so everything keyed on
+    doc_type - output folders, prompt integrity, the report's grouping - works on
+    LOBs unchanged.
+    """
+    lobs = cfg.get("lobs") or {}
+    input_dir = cfg_path(cfg, "input_dir")
+    # Looked up many times per request (prompt blocks, output folders), so the
+    # layout is read once per input_dir and the result kept on the config.
+    cache = cfg.setdefault("_lob_specs_cache", {})
+    if str(input_dir) in cache:
+        return [dict(s) for s in cache[str(input_dir)]]
+    names = {str(k): str(v) for k, v in (lobs.get("names") or {}).items()}
+    kind = str(lobs.get("doc_type_name") or "Policy")
+    prompt_dir = lobs.get("lob_prompt_dir")
+
+    if manifest_path(cfg) is not None:
+        try:
+            ids = sorted({slugify(str(d["lob"])) for d in read_manifest(cfg)["documents"]})
+        except (FileNotFoundError, ValueError):
+            return []
+        dirs = {i: i for i in ids}
+    else:
+        if not input_dir.is_dir():
+            return []
+        folders = sorted(p for p in input_dir.iterdir()
+                         if p.is_dir() and not p.name.startswith(("_", ".")))
+        dirs = {slugify(d.name): d.name for d in folders}
+        ids = list(dirs)
+
+    out: list[dict] = []
+    for lid in ids:
+        pretty = names.get(lid) or names.get(dirs[lid]) or dirs[lid]
+        spec = {"id": lid, "dir": dirs[lid], "name": f"{kind} - {pretty}",
+                "prompt": lobs.get("prompt"), "lob": lid}
+        if prompt_dir:
+            spec["lob_prompt"] = str(Path(prompt_dir) / f"{lid}.txt")
+        out.append(spec)
+    cache[str(input_dir)] = out
+    return [dict(s) for s in out]
+
+
 def doc_type_specs(cfg: dict) -> list[dict]:
-    """The configured document types, in order."""
+    """The document types, in order: discovered LOB folders, or configured doc_types."""
+    if lob_mode(cfg):
+        return lob_specs(cfg)
     return [dict(d) for d in (cfg.get("doc_types") or [])]
 
 
@@ -334,14 +421,24 @@ def looks_like_json_schema(obj: Any) -> bool:
     """Is this a JSON Schema document rather than an instance of one?
 
     POC2's discover_documents globbed *.json and would happily pair
-    input/schema.json as a document's gold. Two independent tells, because a
-    schema may legitimately omit "$schema".
+    input/schema.json as a document's gold. Several independent tells, because a
+    schema may legitimately omit "$schema", and a gold instance may carry a
+    "$schema" key pointing at the schema it conforms to - so the key alone is
+    not enough, its value must name a JSON Schema dialect.
     """
     if not isinstance(obj, dict):
         return False
-    if "$schema" in obj:
+    dialect = obj.get("$schema")
+    if isinstance(dialect, str) and "json-schema.org" in dialect:
         return True
-    return "properties" in obj and obj.get("type") == "object"
+    props = obj.get("properties")
+    if (obj.get("type") == "object" and isinstance(props, dict)
+            and all(isinstance(v, (dict, bool)) for v in props.values())):
+        return True
+    # A LOB schema built purely by composition: allOf/$defs and nothing else.
+    keys = set(obj) - {"$id", "$comment", "title", "description", "type",
+                       "additionalProperties", "required", "properties"}
+    return bool(keys) and keys <= {"allOf", "$defs", "definitions", "$ref"}
 
 
 class Document:
@@ -393,6 +490,7 @@ def classify_jsons(paths, gold_suffixes) -> tuple[dict, dict]:
 def discover_documents(
     cfg: dict,
     gold_suffixes=DEFAULT_GOLD_SUFFIXES,
+    resolve_schemas: bool = True,
 ) -> tuple[list[Document], list[Path], list[Path]]:
     """Pair every PDF with its doc type, its schema and its gold.
 
@@ -409,19 +507,36 @@ def discover_documents(
     (2) is what makes "one schema per doc type" work without renaming anything,
     while (1) still lets a single document override it.
 
+    In LOB mode the schema found this way is the LOB's own schema, and the
+    document is given the RESOLVED schema instead: common + LOB combined into one
+    file under paths.resolved_schema_dir (schema_resolver.py). Pass
+    resolve_schemas=False when only the documents are needed (the report's
+    timing tables): nothing is resolved or written, and doc.schema is the LOB's
+    own schema file.
+
     Returns (documents, unpaired_pdfs, unpaired_golds).
     """
     input_dir = cfg_path(cfg, "input_dir")
     fallback = cfg.get("paths", {}).get("schema")
     fallback_schema = cfg_path(cfg, "schema") if fallback else None
+    resolved_cache: dict = {}
+    if lob_mode(cfg):
+        import schema_resolver
+        if resolve_schemas:
+            schema_resolver.ERRORS.clear()   # report what THIS discovery found
 
     documents: list[Document] = []
     unpaired_pdfs: list[Path] = []
     unmatched_golds: list[Path] = []
     seen_ids: set[str] = set()
 
+    if lob_mode(cfg) and manifest_path(cfg) is not None:
+        return _discover_manifest(cfg, resolve_schemas)
+
     specs = doc_type_specs(cfg)
     if not specs:
+        if lob_mode(cfg):
+            return [], [], []    # no LOB folder yet; callers say where to put them
         raise ValueError("config.yaml defines no doc_types")
 
     for spec in specs:
@@ -433,6 +548,13 @@ def discover_documents(
         schemas, golds = classify_jsons(sorted(tdir.rglob("*.json")), gold_suffixes)
 
         all_schemas = [f for fs in schemas.values() for f in fs]
+        if lob_mode(cfg) and len(all_schemas) > 1:
+            # A LOB schema split across files (the LOB schema + a definitions
+            # file it $refs): only the file no sibling references is a
+            # candidate, so a parts file can never be picked for a document.
+            roots = set(schema_resolver.root_schemas(all_schemas))
+            all_schemas = [f for f in all_schemas if f in roots]
+            schemas = {k: [f for f in fs if f in roots] for k, fs in schemas.items()}
         type_schema = all_schemas[0] if len(all_schemas) == 1 else None
 
         matched: set[Path] = set()
@@ -454,7 +576,39 @@ def discover_documents(
             schema = (schemas.get(key) or [None])[0]
             if schema is None:
                 schema = token_match(pdf.stem, all_schemas, gold_suffixes)
-            schema = schema or type_schema or fallback_schema
+            schema = schema or type_schema
+            # The global fallback only for a folder with NO candidate schema: with
+            # several, falling back would hide the ambiguity reported below.
+            if schema is None and not (lob_mode(cfg) and len(all_schemas) > 1):
+                schema = fallback_schema
+            if lob_mode(cfg) and schema is None and len(all_schemas) > 1:
+                # Several candidate LOB schemas and none named after this PDF:
+                # guessing would silently extract against the wrong one, and
+                # falling back to common-only would silently drop every LOB field.
+                msg = (f"{pdf.name}: the folder holds {len(all_schemas)} LOB schemas "
+                       f"({', '.join(f.name for f in all_schemas)}) and none is named "
+                       f"after this PDF - keep one schema per LOB folder, or name a "
+                       f"schema after the PDF")
+                if resolve_schemas:
+                    schema_resolver.ERRORS.setdefault(tid, []).append(msg)
+                    logging.getLogger("discover").error("%s", msg)
+                schema = False   # resolved below to None, without resolving common-only
+            if lob_mode(cfg) and resolve_schemas and schema is not False:
+                ck = (tid, str(schema))
+                if ck not in resolved_cache:
+                    variant = (None if schema is None or schema == type_schema
+                               else Path(schema).name.split(".")[0])
+                    try:
+                        resolved_cache[ck] = schema_resolver.resolved_schema_path(
+                            cfg, tid, schema, variant)
+                    except schema_resolver.ResolveError as exc:
+                        # The document stays discoverable with no schema, so
+                        # preflight can report the reason instead of crashing.
+                        logging.getLogger("discover").error("%s", exc)
+                        resolved_cache[ck] = None
+                schema = resolved_cache[ck]
+            elif schema is False:
+                schema = None
 
             doc_id = slugify(pdf.stem)
             if doc_id in seen_ids:
@@ -473,16 +627,95 @@ def discover_documents(
     return documents, unpaired_pdfs, unmatched_golds
 
 
-def select_documents(cfg: dict) -> list[Document]:
-    """Documents this run covers, honouring corpus.documents and corpus.require_gold."""
+def _discover_manifest(cfg: dict, resolve_schemas: bool = True
+                       ) -> tuple[list[Document], list[Path], list[Path]]:
+    """Documents exactly as lobs.manifest lists them - no pairing by name.
+
+    Each entry names its PDF, gold and LOB schema, so nothing is guessed. A PDF or
+    gold JSON in the input folder that the manifest does not list is returned as
+    unpaired, so preflight can point it out.
+    """
+    import schema_resolver
+    if resolve_schemas:
+        schema_resolver.ERRORS.clear()
+    try:
+        man = read_manifest(cfg)
+    except (FileNotFoundError, ValueError) as exc:
+        logging.getLogger("discover").error("%s", exc)
+        return [], [], []
+    base = manifest_path(cfg).parent
+    documents: list[Document] = []
+    resolved_cache: dict = {}
+    listed: set[Path] = set()
+    seen_ids: set[str] = set()
+    for entry in man["documents"]:
+        pdf = (base / entry["pdf"]).resolve()
+        gold = (base / entry["gold"]).resolve() if entry.get("gold") else None
+        schema = (base / entry["schema"]).resolve()
+        lob = slugify(str(entry["lob"]))
+        listed |= {pdf} | ({gold} if gold else set())
+        base_id = slugify(str(entry.get("id") or pdf.stem))
+        doc_id, n = base_id, 1
+        while doc_id in seen_ids:
+            # Ids name the OCR cache and the output files: a collision would
+            # make two documents overwrite each other.
+            n += 1
+            doc_id = f"{lob}-{base_id}" if n == 2 else f"{lob}-{base_id}-{n}"
+        seen_ids.add(doc_id)
+        problems = [f"{k} {p.name} not found" for k, p in
+                    (("pdf", pdf), ("gold", gold), ("schema", schema)) if p and not p.exists()]
+        if problems:
+            msg = f"manifest entry {doc_id}: " + "; ".join(problems)
+            if resolve_schemas:
+                schema_resolver.ERRORS.setdefault(lob, []).append(msg)
+            logging.getLogger("discover").error("%s", msg)
+            if not pdf.exists():
+                continue
+            gold = gold if gold and gold.exists() else None
+        resolved = schema if schema.exists() else None
+        if resolve_schemas and resolved is not None:
+            if str(schema) not in resolved_cache:
+                # Two schema files under one LOB must not share a resolved file:
+                # one named for the LOB keeps the plain name, any other gets a
+                # suffix.
+                variant = None if slugify(schema.stem) == lob else schema.stem
+                try:
+                    resolved_cache[str(schema)] = schema_resolver.resolved_schema_path(
+                        cfg, lob, schema, variant)
+                except schema_resolver.ResolveError as exc:
+                    logging.getLogger("discover").error("%s", exc)
+                    resolved_cache[str(schema)] = None
+            resolved = resolved_cache[str(schema)]
+        documents.append(Document(doc_id, pdf, gold, doc_type=lob, schema=resolved))
+
+    # Files sitting in the folders the manifest uses but not listed in it -
+    # most likely a document someone added and forgot to register.
+    pdf_dirs = {p.parent for p in listed if p.suffix.lower() == ".pdf"}
+    gold_dirs = {p.parent for p in listed if p.suffix.lower() == ".json"}
+    unpaired = sorted(p.resolve() for d in pdf_dirs for p in d.glob("*.pdf")
+                      if p.resolve() not in listed and not p.name.startswith("."))
+    orphans = sorted(p.resolve() for d in gold_dirs for p in d.glob("*.json")
+                     if p.resolve() not in listed and not p.name.startswith("."))
+    documents.sort(key=lambda d: (d.doc_type, d.doc_id))
+    return documents, unpaired, orphans
+
+
+def select_documents(cfg: dict, resolve_schemas: bool = True,
+                     require_gold: bool | None = None) -> list[Document]:
+    """Documents this run covers, honouring corpus.documents and corpus.require_gold.
+
+    require_gold overrides corpus.require_gold (timing needs no gold);
+    resolve_schemas=False lists documents without touching resolved schemas.
+    """
     corpus = cfg.get("corpus", {}) or {}
     docs, _unpaired, _ = discover_documents(
-        cfg, tuple(corpus.get("gold_suffixes") or DEFAULT_GOLD_SUFFIXES))
+        cfg, tuple(corpus.get("gold_suffixes") or DEFAULT_GOLD_SUFFIXES), resolve_schemas)
     wanted = corpus.get("documents")
     if wanted:
         wanted = {str(w) for w in wanted}
         docs = [d for d in docs if d.doc_id in wanted or d.doc_type in wanted]
-    if corpus.get("require_gold", True):
+    need_gold = corpus.get("require_gold", True) if require_gold is None else require_gold
+    if need_gold:
         docs = [d for d in docs if d.gold is not None]
     return docs
 

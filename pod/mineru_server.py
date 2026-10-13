@@ -9,8 +9,15 @@ design would work on short documents and fail on long ones, which is the hardest
 kind of bug to pin down. Uploading takes seconds and each poll answers instantly,
 so both stay far inside the proxy's tolerance.
 
-One worker thread, deliberately: MinerU shares this GPU with two vLLM servers, so
-OCR jobs are serialised rather than allowed to pile up against the KV cache.
+One worker thread, deliberately: MinerU shares this GPU with the vLLM server, so
+OCR jobs are serialised rather than allowed to pile up against the KV cache. It
+also keeps the timing honest - one job never slows another down.
+
+Every finished job reports its own timing, measured HERE rather than by the
+client, so it excludes the upload, the proxy and the client's polling interval:
+  queue_wait_s  - submitted -> started (non-zero only if jobs queued up)
+  elapsed_s     - started -> finished: the processing time of this document
+  timing        - cli_s (the MinerU process) and parse_s (per-page rebuild)
 
 The proxy is PUBLIC - anyone with the pod id can reach this port - so set
 POC3_API_KEY and the client must send it as X-POC3-Key.
@@ -21,6 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -55,15 +63,39 @@ def _auth(key: str | None) -> None:
         raise HTTPException(status_code=401, detail="bad or missing X-POC3-Key")
 
 
-def _free_vram_gb() -> float | None:
+def _nvidia_smi(field: str) -> str | None:
+    """One value for GPU 0 from nvidia-smi.
+
+    nvidia-smi, not torch: torch.cuda would open a CUDA context inside this
+    server process and hold VRAM on the GPU that vLLM and the MinerU
+    subprocess share.
+    """
     try:
-        import torch
-        if not torch.cuda.is_available():
-            return None
-        free, _total = torch.cuda.mem_get_info()
-        return round(free / (1024 ** 3), 2)
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        line = (out.stdout or "").strip().splitlines()
+        return line[0].strip() if out.returncode == 0 and line else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _free_vram_gb() -> float | None:
+    mib = _nvidia_smi("memory.free")
+    try:
+        return round(float(mib) / 1024, 2) if mib else None
+    except ValueError:
+        return None
+
+
+_GPU_NAME: list = []
+
+
+def _gpu_name() -> str | None:
+    """The GPU's name, read once - it does not change while the server runs."""
+    if not _GPU_NAME:
+        _GPU_NAME.append(_nvidia_smi("name"))
+    return _GPU_NAME[0]
 
 
 def _models_ready() -> bool:
@@ -116,6 +148,7 @@ def health() -> dict:
         "status": "ok",
         "mineru_version": mineru_ocr.mineru_version(),
         "device": mineru_ocr.resolve_device("auto"),
+        "gpu": _gpu_name(),
         "models_ready": _models_ready(),
         "free_vram_gb": _free_vram_gb(),
         "jobs": {"running": running, "queued": queued, "total": len(JOBS)},
@@ -130,24 +163,35 @@ def _work(job_id: str, pdf: Path, n_pages: int, backend: str, lang: str,
             if job_id in JOBS:
                 JOBS[job_id]["progress"] = {"page": page, "of": of}
 
+    t0 = time.time()
     with LOCK:
         JOBS[job_id]["status"] = "running"
-    t0 = time.time()
+        JOBS[job_id]["started_at"] = t0
+        queue_wait = round(t0 - JOBS[job_id]["t0"], 3)
+    timing: dict = {}
     try:
         pages = mineru_ocr.run_mineru(pdf, n_pages, backend, lang, device,
-                                      keep_discarded, progress)
+                                      keep_discarded, progress, timing)
+        elapsed = round(time.time() - t0, 3)
+        gpu = _gpu_name()              # outside the lock: polls never wait on it
         with LOCK:
             JOBS[job_id].update(
                 status="done",
                 pages=[{"page": i, "markdown": md} for i, md in enumerate(pages, 1)],
                 chars_per_page=[len((m or "").strip()) for m in pages],
-                elapsed_s=round(time.time() - t0, 1),
+                elapsed_s=elapsed,
+                queue_wait_s=queue_wait,
+                timing=timing,
+                gpu=gpu,
+                finished_at=time.time(),
             )
-        log.info("job %s done in %.1fs (%d pages)", job_id, time.time() - t0, len(pages))
+        log.info("job %s done in %.1fs (%d pages, %.2fs/page)", job_id, elapsed,
+                 len(pages), elapsed / max(1, len(pages)))
     except Exception as exc:  # noqa: BLE001 - the client needs the reason, not a 500
         with LOCK:
             JOBS[job_id].update(status="error", error=f"{type(exc).__name__}: {exc}",
-                                elapsed_s=round(time.time() - t0, 1))
+                                elapsed_s=round(time.time() - t0, 3),
+                                queue_wait_s=queue_wait, timing=timing)
         log.exception("job %s failed", job_id)
     finally:
         Path(pdf).unlink(missing_ok=True)
@@ -192,7 +236,9 @@ def status(job_id: str, x_poc3_key: str | None = Header(None)) -> dict:
         if not state:
             raise HTTPException(status_code=404, detail="unknown job_id")
         out = {k: v for k, v in state.items() if k != "pdf"}
-    out["elapsed_s"] = out.get("elapsed_s") or round(time.time() - out["t0"], 1)
+    if out.get("status") in ("queued", "running"):
+        # Still going: report time so far, from start if started, else from submit.
+        out["elapsed_s"] = round(time.time() - (out.get("started_at") or out["t0"]), 1)
     return out
 
 

@@ -18,18 +18,20 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from common import ensure_dir, pymupdf, read_text, write_json
+from common import ensure_dir, pymupdf, read_text, utc_now_iso, write_json
 
 _PAGE_RE = re.compile(r"^page_(\d+)$")
 
-# Qwen VL packs 14px patches and merges 2x2, so a page costs about
-# (W/28) * (H/28) visual tokens. Good to within a few percent, which is all a
-# budget check needs.
-PATCH = 28
+# Qwen3-VL packs 16px patches and merges 2x2, so a page costs about
+# (W/32) * (H/32) visual tokens - measured at ~770-800 per 1024px letter page on
+# the earlier run. (Qwen2.5-VL was 14px -> 28.) Good to within a few percent,
+# which is all a budget check needs.
+PATCH = 32
 
 
 @dataclass
@@ -53,6 +55,7 @@ class RenderResult:
     pages: list[Page] = field(default_factory=list)
     dpi: int = 0
     max_long_side: int = 0
+    elapsed_s: float = 0.0
 
     @property
     def total_png_bytes(self) -> int:
@@ -80,6 +83,7 @@ def render_pages(pdf: Path, out_dir: Path, dpi: int = 200,
     for stale in out_dir.glob("page_*.png"):
         stale.unlink()
 
+    t0 = time.perf_counter()
     pages: list[Page] = []
     with fitz.open(str(pdf)) as doc:
         for i, page in enumerate(doc, start=1):
@@ -100,7 +104,8 @@ def render_pages(pdf: Path, out_dir: Path, dpi: int = 200,
             pages.append(Page(index=i, png=png, width=pix.width, height=pix.height,
                               png_bytes=png.stat().st_size))
 
-    return RenderResult(pages=pages, dpi=dpi, max_long_side=max_long_side)
+    return RenderResult(pages=pages, dpi=dpi, max_long_side=max_long_side,
+                        elapsed_s=round(time.perf_counter() - t0, 3))
 
 
 def image_token_estimate(width: int, height: int, patch: int = PATCH) -> int:
@@ -182,7 +187,7 @@ def require_pages(ocr_dir: Path, case: str, want_png: bool, want_md: bool) -> li
         raise FileNotFoundError(
             f"no page assets in {ocr_dir} for case {case!r}. "
             f"Run src/preflight.py --local to render pages"
-            + (", and src/ocr_client.py to fetch markdown." if want_md else ".")
+            + (", and src/runner.py --ocr-only to fetch markdown." if want_md else ".")
         )
     if want_png:
         missing = [p.index for p in pages if not (p.png and p.png.exists())]
@@ -195,7 +200,7 @@ def require_pages(ocr_dir: Path, case: str, want_png: bool, want_md: bool) -> li
         if missing:
             raise FileNotFoundError(
                 f"case {case!r} needs MinerU markdown but pages {missing} have none in "
-                f"{ocr_dir}. Run src/ocr_client.py for this document."
+                f"{ocr_dir}. Run src/runner.py --ocr-only for this document."
             )
     return pages
 
@@ -241,6 +246,9 @@ def write_render_meta(ocr_dir: Path, doc_id: str, result: RenderResult,
         # base64 inflates by 4/3, and that is what actually crosses the proxy.
         "total_wire_b64_mb": round(wire_total * 4 / 3 / (1024 * 1024), 3),
         "total_image_tokens_est": sum(v["image_tokens_est"] for v in pages.values()),
+        # Wall time to rasterise every page on THIS machine (PyMuPDF, CPU).
+        "render_s": result.elapsed_s,
+        "rendered_at": utc_now_iso(),
         "pages": pages,
     }
     write_json(_render_meta_path(ocr_dir), meta)

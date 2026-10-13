@@ -2,19 +2,22 @@
 
     python src/report.py
 
-Reads every output/<tag>/<case>/*.score.json and *.meta.json and writes, into
-output/report/:
-    comparison.json   everything, machine-readable
-    comparison.md     the human report
-    matrix.csv        one row per cell
+Reads every <output_dir>/<tag>/<case>/<LOB>/*.score.json and *.meta.json, plus
+the MinerU and render timings under the OCR work dir, and writes into the
+report dir:
+    comparison.json   accuracy, machine-readable
+    comparison.md     accuracy, the human report
+    matrix.csv        one row per cell (document x case)
     per_field.csv     field x cell recall grid
+    timing.md/.json   MinerU and model timing (see timing.py)
+    mineru_timing.csv, model_latency.csv, end_to_end.csv
 
-THE THREE DELTAS ARE THE POINT:
-    8B - 7B, per case          is the bigger model better, and in the same places?
+THE DELTAS ARE THE POINT:
     PDF+MD - PDF only          does MinerU markdown help?
-    MD only - PDF+MD           do the page images still earn their cost?
+    PDF+MD - MD only           do the page images still earn their cost?
+    (and bigger - smaller model, per case, when more than one model ran)
 
-prompt_integrity() runs first and gates the rest. If the six cells were not asked
+prompt_integrity() runs first and gates the rest. If the cases were not asked
 the same question, the deltas are not measurements and the report says so instead
 of printing them.
 """
@@ -64,7 +67,7 @@ def load_cells(cfg: dict) -> list[dict]:
 
 
 def prompt_integrity(rows: list[dict], cfg: dict) -> dict:
-    """Were all six cells asked the same question?
+    """Were all the cells of a document asked the same question?
 
     Two invariants, and they pull in opposite directions on purpose:
       - the shared prompt span (everything but the modality paragraph) must hash
@@ -77,17 +80,22 @@ def prompt_integrity(rows: list[dict], cfg: dict) -> dict:
     problems: list[str] = []
     shared_by_doc: dict[tuple, set] = {}
     fp_by_key: dict[tuple, set] = {}
+    plan_by_doc: dict[tuple, set] = {}
 
     for r in rows:
         key = (r.get("doc_type", ""), r.get("doc_id", ""))
         sha = r["meta"].get("shared_prompt_sha")
         if sha:
             shared_by_doc.setdefault(key, set()).add(sha)
+        plan = r["meta"].get("window_plan")
+        if plan:
+            plan_by_doc.setdefault(key, set()).add(
+                (str(plan), str(r["meta"].get("reference_pages"))))
         fp = r["meta"].get("conversation_fingerprint")
         if fp:
             fp_by_key.setdefault((*key, r["case"]), set()).add(fp)
 
-    # The shared span must be constant across the six cells of ONE DOCUMENT. It
+    # The shared span must be constant across the cells of ONE DOCUMENT. It
     # legitimately differs between documents (each carries its own schema) and
     # between doc types (each carries its own doc-type paragraph), so comparing
     # spans any more widely than this reports a false alarm.
@@ -98,6 +106,16 @@ def prompt_integrity(rows: list[dict], cfg: dict) -> dict:
                 f"({sorted(shas)}). Those cells were not asked the same question, so "
                 f"the deltas for this document are not comparable. Did a prompt file "
                 f"or its schema change mid-run?")
+
+    # Every case of a document must have been split the same way and shown the
+    # same reference pages, or the case comparison measures the split.
+    for (tid, doc_id), plans in plan_by_doc.items():
+        if len(plans) > 1:
+            problems.append(
+                f"{tid}/{doc_id}: its cases were split into DIFFERENT page windows or "
+                f"given different reference pages ({sorted(p for p, _ in plans)}). Was "
+                f"MinerU re-run or chunking changed between cases? Re-run the document "
+                f"with --overwrite.")
 
     # For one document and one case, both models must have seen identical input.
     for (tid, doc_id, case), fps in fp_by_key.items():
@@ -147,18 +165,27 @@ def matrix_table(rows: list[dict]) -> list[dict]:
     out = []
     for r in rows:
         m, s = r["meta"], r["score"]
+        merge = m.get("merge") or {}
         out.append({
             "cell": r["cell"],
             "model": r["model_tag"],
             "case": r["case"],
             "doc_id": r["doc_id"],
             "doc_type": r.get("doc_type", ""),
+            "n_pages": m.get("n_pages"),
+            "n_windows": m.get("n_windows"),
+            "merged_entities": merge.get("entities_merged_across_windows"),
+            "merge_conflicts": merge.get("conflict_count"),
+            "failed_windows": m.get("failed_windows"),
             "status": m.get("status"),
             "field_f1": s.get("field_f1"),
             "field_recall": s.get("field_recall"),
             "field_precision": s.get("field_precision"),
             "strict_match_rate": (s.get("strict") or {}).get("match_rate"),
             "number_coverage": (s.get("coverage") or {}).get("number_coverage"),
+            # Scored apart from field_f1 (scoring.page_ref_keys / separate_sections).
+            "page_ref_f1": ((s.get("separate") or {}).get("page_references") or {}).get("f1"),
+            "text_sections_f1": ((s.get("separate") or {}).get("text_sections") or {}).get("f1"),
             "score_is_floor": s.get("score_is_floor", False),
             "json_valid_strict": m.get("json_valid_strict"),
             "repaired": m.get("repaired_from_truncation"),
@@ -170,6 +197,7 @@ def matrix_table(rows: list[dict]) -> list[dict]:
             "finish_reason": m.get("finish_reason"),
             "first_byte_s": m.get("first_byte_s"),
             "total_s": m.get("total_s"),
+            "latency_per_page_s": m.get("latency_per_page_s"),
             "attempts": m.get("attempts"),
             "error": m.get("error"),
         })
@@ -184,7 +212,7 @@ def per_field_grid(rows: list[dict], min_gold: int = 1) -> dict:
     schema, so a field path exists in one document and not the others; merging
     them into a single grid produces a table of mostly-empty cells whose columns
     repeat once per document. The comparison that means something is between the
-    six cells of ONE document.
+    cells of ONE document.
     """
     per_doc: dict = {}
     for r in rows:
@@ -284,7 +312,9 @@ def render_markdown(cfg: dict, rows: list[dict], integrity: dict, matrix: list[d
     L: list[str] = []
     a = L.append
 
-    a("# POC3 - extraction quality by model and input modality")
+    models = sorted({r["model_tag"] for r in rows})
+    a("# POC3 - extraction quality by input modality"
+      + (f" ({', '.join(models)})" if len(models) == 1 else " and model"))
     a("")
     a(f"Generated {common.utc_now_iso()}")
     a("")
@@ -298,11 +328,29 @@ def render_markdown(cfg: dict, rows: list[dict], integrity: dict, matrix: list[d
         a("Fix the above and re-run. Everything below is printed for diagnosis only.")
         a("")
     else:
-        a("Prompt integrity verified: for every document, all six cells share one "
-          "system prompt and one schema block; for every document and case both "
-          "models received byte-identical input; and no two cases sent the same "
-          "input. Prompts differ between documents and document types by design - "
-          "each document carries its own canonical schema.")
+        a("Prompt integrity verified: for every document, every case shares one "
+          "system prompt and one schema block"
+          + ("; for every document and case each model received byte-identical "
+             "input" if len(models) > 1 else "")
+          + "; and no two cases sent the same input. Prompts differ between lines "
+          "of business by design - each LOB has its own resolved canonical schema.")
+        a("")
+    ch = cfg.get("chunking") or {}
+    if any((r["meta"].get("n_windows") or 1) > 1 for r in rows):
+        ctx = ch.get("context") or {}
+        sec = ch.get("section_boundaries") or {}
+        a(f"Documents longer than {ch.get('window_pages')} pages were extracted in "
+          f"windows of about {ch.get('window_pages')} pages overlapping by "
+          f"{ch.get('overlap_pages', 0)}"
+          + (f", boundaries moved up to {sec.get('max_shift_pages')} pages to land on "
+             f"section starts" if sec.get("enabled") else "")
+          + ("." if not (ctx.get("anchor_pages") or ctx.get("carry_forward")) else
+             ". Every later window was given " + " and ".join(x for x in (
+                 f"reference page(s) {ctx.get('anchor_pages')}" if ctx.get("anchor_pages") else "",
+                 "a digest of what earlier windows extracted" if ctx.get("carry_forward") else "")
+                 if x) + ".")
+          + " The window outputs were merged into one canonical JSON; the same "
+          "windows were used for every case. Timing is in timing.md.")
         a("")
 
     mock = any(r["meta"].get("mock") for r in rows)
@@ -327,27 +375,33 @@ def render_markdown(cfg: dict, rows: list[dict], integrity: dict, matrix: list[d
 
     a("## Results per document")
     a("")
-    a("| doc type | document | cell | status | F1 | recall | precision | strict | num.cov | tokens in/out | s |")
-    a("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    a("`F1` scores the document's values. Extraction bookkeeping (scoring.ignore_keys, "
+      "e.g. confidence) is not scored; WHERE values are printed (`page refs`) and the "
+      "section index (`text sec.`) are scored separately so they do not dilute it.")
+    a("")
+    a("| LOB | document | pages | windows | cell | status | F1 | recall | precision | page refs | text sec. | strict | num.cov | tokens in/out | s |")
+    a("|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in matrix:
         floor = " *" if r.get("score_is_floor") else ""
-        a(f"| {r.get('doc_type','')} | {r['doc_id']} "
+        a(f"| {r.get('doc_type','')} | {r['doc_id']} | {_n(r.get('n_pages'))} | "
+          f"{_n(r.get('n_windows'))} "
           f"| {r['cell']} | {r['status']} | {_f(r['field_f1'])}{floor} | "
           f"{_f(r['field_recall'])} | {_f(r['field_precision'])} | "
+          f"{_f(r.get('page_ref_f1'))} | {_f(r.get('text_sections_f1'))} | "
           f"{_f(r['strict_match_rate'])} | {_f(r['number_coverage'])} | "
           f"{_n(r['prompt_tokens'])}/{_n(r['completion_tokens'])} | "
           f"{_f(r['total_s'], 1)} |")
     a("")
     if any(r.get("score_is_floor") for r in matrix):
-        a("`*` output was truncated and repaired to its valid prefix. That score is "
-          "a **floor, not a measurement** - the tail was never generated. Without "
-          "this note a more verbose model reads as a worse one.")
+        a("`*` part of the output was never generated: a window was truncated and "
+          "repaired to its valid prefix (REPAIRED), or a window produced no JSON at "
+          "all (PARTIAL). That score is a **floor, not a measurement**.")
         a("")
 
-    a("## The three questions")
+    a("## The questions")
     a("")
     titles = {
-        "model": "Is the bigger model better? (8B - 7B, per case)",
+        "model": "Is the bigger model better? (per case)",
         "markdown_helps": "Does MinerU markdown help? (PDF+MD - PDF only)",
         "images_earn_their_cost": "Do the page images still earn their cost? (PDF+MD - MD only)",
     }
@@ -433,12 +487,19 @@ def render_markdown(cfg: dict, rows: list[dict], integrity: dict, matrix: list[d
 
     a("## Health")
     a("")
-    a("| cell | JSON valid | repaired | schema ok | images | payload MB | attempts | error |")
-    a("|---|---|---|---|---:|---:|---:|---|")
+    a("`merged` counts entities two windows both reported and the merge combined "
+      "into one; `conflicts` counts single fields two windows filled differently "
+      "(the earlier window's value is kept by default - every conflict is listed "
+      "in the cell's meta.json under merge.conflicts).")
+    a("")
+    a("| document | cell | windows | failed windows | merged | conflicts | JSON valid | repaired | schema ok | images | max payload MB | attempts | error |")
+    a("|---|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---|")
     for r in matrix:
-        a(f"| {r['cell']} | {r['json_valid_strict']} | {r['repaired']} | "
-          f"{r['schema_ok']} | {r['n_images']} | {_f(r['payload_mb'], 2)} | "
-          f"{r['attempts']} | {(r['error'] or '')[:60]} |")
+        a(f"| {r['doc_id']} | {r['cell']} | {_n(r.get('n_windows'))} | "
+          f"{_n(r.get('failed_windows'))} | {_n(r.get('merged_entities'))} | "
+          f"{_n(r.get('merge_conflicts'))} | {r['json_valid_strict']} | {r['repaired']} | "
+          f"{r['schema_ok']} | {_n(r['n_images'])} | {_f(r['payload_mb'], 2)} | "
+          f"{_n(r['attempts'])} | {(r['error'] or '')[:60]} |")
     a("")
     a("---")
     a("")
@@ -467,6 +528,27 @@ def main() -> int:
     log = common.setup_logging("report", (cfg.get("runtime") or {}).get("log_level", "INFO"))
 
     rows = load_cells(cfg)
+    rep_dir = common.ensure_dir(common.cfg_path(cfg, "report_dir"))
+    formats = [str(f).lower() for f in ((cfg.get("report") or {}).get("formats")
+                                        or ["json", "md", "csv"])]
+
+    # Timing first: a MinerU-only run (--ocr-only) has timings and no cells yet.
+    # Every discovered document counts here, gold or not - timing needs no gold.
+    # Schemas are NOT re-resolved: the report must not rewrite the resolved
+    # schemas the scored cells were run against.
+    import timing
+    docs = common.select_documents(cfg, resolve_schemas=False, require_gold=False)
+    t = timing.write(cfg, rows, docs, rep_dir, formats)
+    ms = t["mineru_summary"]
+    if ms.get("documents"):
+        log.info("MinerU: %d docs, %d pages, %.1fs -> %s s/page, %s chars/page",
+                 ms["documents"], ms["pages"], ms["processing_s"],
+                 ms["s_per_page_overall"], ms["chars_per_page_overall"])
+    for case, cs in t["model_summary"].items():
+        log.info("model %-9s %d docs, %.1fs -> %s s/page", case, cs["documents"],
+                 cs["model_latency_s"], cs["s_per_page_overall"])
+    log.info("wrote %s", rep_dir / "timing.md")
+
     if not rows:
         log.error("no cells found under %s - run src/runner.py first",
                   common.cfg_path(cfg, "output_dir"))
@@ -477,10 +559,6 @@ def main() -> int:
     deltas = pairwise_deltas(rows)
     grids = per_field_grid(
         rows, int((cfg.get("report") or {}).get("per_field_min_gold", 1)))
-
-    rep_dir = common.ensure_dir(common.cfg_path(cfg, "report_dir"))
-    formats = [str(f).lower() for f in ((cfg.get("report") or {}).get("formats")
-                                        or ["json", "md", "csv"])]
 
     if "json" in formats:
         common.write_json(rep_dir / "comparison.json", {
@@ -516,8 +594,11 @@ def main() -> int:
         log.info("prompt integrity OK across %d cells", len(rows))
 
     log.info("wrote %s", rep_dir / "comparison.md")
-    for d in (deltas.get("model") or []):
-        log.info("  %s vs %s: %+.3f", d["a"], d["b"], d["delta"] or 0.0)
+    for cell, v in sorted(cell_summary(rows).items()):
+        log.info("  %-14s mean F1 %.3f over %d docs", cell, v["mean_f1"], v["n_docs"])
+    for key in ("model", "markdown_helps", "images_earn_their_cost"):
+        for d in (deltas.get(key) or []):
+            log.info("  %s vs %s: %+.3f", d["a"], d["b"], d["delta"] or 0.0)
     return 0 if integrity["ok"] else 1
 
 

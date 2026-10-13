@@ -1,313 +1,354 @@
-# POC3 — PDF→JSON extraction quality: 2 models × 3 input modalities
+# POC3 — policy extraction with MinerU + Qwen3-VL-8B: quality and time
 
-Which small VLM extracts a Policy Declaration into your canonical JSON more
-faithfully, and does MinerU markdown help? Six cells, scored per field against
-your golden canonical JSON.
+How well, and how fast, does `Qwen3-VL-8B-Instruct` turn insurance **policy
+documents** into your **canonical JSON**, given three kinds of input?
 
-|          | `Qwen2.5-VL-7B-Instruct` → `output/7B/` | `Qwen3-VL-8B-Instruct` → `output/8B/` |
-|----------|------------------------------------------|----------------------------------------|
-| PDF only | page images                              | page images                            |
-| PDF+MD   | images + MinerU markdown, interleaved    | images + MinerU markdown, interleaved  |
-| MD only  | MinerU markdown, no images               | MinerU markdown, no images             |
+| case | the model receives |
+|---|---|
+| MD only  | MinerU markdown of every page, no images |
+| PDF only | the page images, no OCR text |
+| PDF+MD   | each page's image and its MinerU markdown, side by side |
 
-**The measurement is the deliverable.** Six cells only compare models if nothing
-else differs between them. One system prompt, one schema block, one set of output
-rules, one decoder config, one parser, one scorer — exactly one paragraph and the
-shape of the user turn vary by case. `report.py` verifies this and refuses to
-present the deltas as results if it does not hold.
+For every document and case it produces the canonical JSON, scores it per field
+against your gold JSON, and measures:
+
+- **MinerU time** per document, per page and per 1,000 characters, split into a
+  fixed start-up cost and a per-page cost;
+- **model latency** per document and case — time to first token, decode speed,
+  total, seconds per page;
+- **end to end** per case (render + MinerU + model), and a projection of how long
+  a policy of N pages takes.
+
+The original two-model run (Qwen2.5-VL-7B vs Qwen3-VL-8B over ACORD forms, loss
+runs and policies) is commit `a57bc38` on `main`.
 
 ## Architecture
 
 ```
-  WINDOWS  (D:\POC3)                        RUNPOD POD  (RTX PRO 6000, 96 GB)
-  ------------------                        ---------------------------------
-  render pages (PyMuPDF)
-  build prompts from input/schema.json
-  stream requests  ──────────────────────►  :8000  vLLM  Qwen2.5-VL-7B
-                   ──────────────────────►  :8001  vLLM  Qwen3-VL-8B
-  upload PDF, poll ──────────────────────►  :8002  MinerU job API
-  parse / repair JSON
-  score vs gold, write output/
+  WINDOWS  (D:\POC3)                              RUNPOD POD  (RTX PRO 6000, 96 GB)
+  ------------------                              ---------------------------------
+  resolve common + LOB schema -> one per LOB
+  phase 1  render pages (PyMuPDF)
+           upload PDF, poll  ───────────────────►  :8002  MinerU job API   (timed on the pod)
+  phase 2  per document, per case, per window:
+           stream request    ───────────────────►  :8003  vLLM  Qwen3-VL-8B
+           parse / repair JSON
+           merge windows -> one canonical JSON
+           validate, score vs gold, write output_policies/
+  report   comparison.md (accuracy) + timing.md (time)
 ```
 
-Two constraints shape the whole design:
+Phase 1 runs MinerU on **every** document before phase 2 makes any model call,
+so the two never share the GPU at the same moment and neither timing is
+polluted by the other.
 
-1. **The RunPod proxy kills any request that sends no bytes for ~100 s.** A
-   15-page multimodal prefill and a MinerU run both exceed that. So every model
-   call streams (enforced in code, not config), and MinerU is a submit+poll job
-   API rather than one long POST.
-2. **The two models are different architectures** (`Qwen2_5_VLForConditionalGeneration`
-   vs `Qwen3VLForConditionalGeneration`). One install covers both at
-   `vllm>=0.11` + `transformers>=4.57`; `setup_pod.sh` asserts that *before*
-   downloading 33 GB of weights. All model-specific behaviour stays server-side,
-   so this side has zero per-model branching.
+Two constraints shape the design:
 
-## Install (Windows)
+1. **The RunPod proxy kills any request that sends no bytes for ~100 s.** Every
+   model call streams (enforced in code), and MinerU is a submit + poll job API.
+2. **Long documents.** A 90-page policy in PDF+MD would be a ~200k-token prompt.
+   Instead every document is split into **page windows** (default 10 pages,
+   overlapping by 1), each window is one request against the full schema, and
+   the window outputs are merged into one canonical JSON. The same windows are
+   used for all three cases, so the case comparison is unaffected.
 
-```powershell
-pip install -r requirements.txt
-```
-
-No torch, no vLLM, no transformers, no MinerU locally — all model execution is on
-the pod behind an HTTP boundary.
-
-## What goes in `input/`
-
-One folder per document type. Within a type the layout is free - PDFs anywhere,
-JSONs anywhere - because pairing is by normalised filename stem and a JSON is
-classified as schema or gold by its **content**, not its location.
+## The test set: `input/policy/`
 
 ```
-input/
-  policy/          Policy Declarations   (4 PDFs, all scanned - MinerU mandatory)
-    pdfs/    AUTOP 2.pdf  BOAT 2.pdf  DFIRE Dec Page.pdf  HOME.pdf
-    schema/  <stem>.schema.json
-    gold/    <stem>.json
-  loss runs/       Loss Run              (3 PDFs, digital text layer)
-    pdfs/    14864356 2.pdf  AIG_LossRun_Policy.pdf  LibertyMutual-Lossruns.pdf
-    schema/  ...   gold/  ...
-  acord forms/     ACORD Form            (1 PDF, digital text layer)
-    pdfs/    BINDER- ACORD 75.pdf
-    schema/  ...   gold/  ...
+input/policy/
+  manifest.json      one entry per document: its PDF, gold JSON, LOB and LOB schema
+  pdfs/              the 10 scanned (image-only) policy PDFs
+  gold/              one gold JSON per PDF
+  schema/            common_model.json + one canonical schema per LOB
+  raw data/          the source folders, untouched
 ```
 
-Schema resolution per PDF, first hit wins: a schema whose stem matches the PDF →
-the single schema in that doc type's folder → `paths.schema`. So "one schema per
-type" needs no renaming, and a single document can still override it.
+| id | LOB | pages | PDF |
+|---|---|---:|---|
+| prop_policy_1 | homeowners | 4 | PROP-Policy-1_scanned.pdf |
+| boppr | boppr | 6 | BOPPR_scanned.pdf |
+| endorsement_capi056240 | auto | 8 | ENDORSEMENT_CAPI056240_scanned.pdf |
+| policy | professional_eo | 28 | Policy_scanned.pdf |
+| inmrc | inland_marine | 30 | INMRC_scanned.pdf |
+| dec_page | wc | 31 | dec_page_scanned.pdf |
+| health_main | health | 50 | HEALTH Main_scanned.pdf |
+| shelterpoint_health | health | 50 | shelterpoint_health_scanned.pdf |
+| policy_01 | gl | 74 | policy_01_scanned.pdf |
+| bop | bopgl | 111 | BOP_scanned.pdf |
 
-Output mirrors the three dimensions:
+**Why a manifest.** Neither a gold file nor a PDF name says which LOB schema it
+belongs to (`Policy`, `dec_page`). The raw-data folder it came from was the only
+record of that, so `manifest.json` keeps it, and nothing is paired by guessing
+names.
+
+**Adding a document.** Put its files in `pdfs/`, `gold/` and `schema/`, and add an
+entry to `manifest.json`. A PDF or gold file that sits in those folders but is
+missing from the manifest is reported by preflight.
+
+**The common schema.** `common_model.json` is a definitions library: 77 shared
+shapes and no fields of its own. Each LOB schema `$ref`s the definitions it uses,
+and only those are copied into its resolved schema (48–61 per LOB).
+
+### Alternative layout: one folder per LOB
+
+Leave `lobs.manifest` unset, and each folder directly under `paths.input_dir`
+becomes one LOB. Everything in it is discovered by content, so sub-folders and
+file names are free.
 
 ```
-output/<model tag>/<case>/<doc type>/<doc>.json
-        7B | 8B      PDF only        policy
-                     PDF+MD          loss runs
-                     MD only         acord forms
+input_policies/
+  common.schema.json          the common canonical schema (paths.common_schema)
+  Homeowners/                 one folder per LOB
+    homeowners.schema.json    that LOB's canonical schema
+    HOME 1234.pdf             its policy documents...
+    HOME 1234.json            ...and a gold JSON per PDF, paired by file name
+  Commercial Auto/
+    ...
 ```
+
+- **Pairing.** A PDF takes the gold JSON whose name matches it after
+  normalisation (`HOME 1234.pdf` ↔ `home_1234_golden.json`), else the best
+  distinctive-token match.
+- **Schema vs gold** is decided by content: a file declaring a JSON Schema
+  dialect, or shaped like a schema, is a schema; anything else is a gold.
+- **One LOB schema per folder.** A LOB schema may be split across files (the LOB
+  schema plus a definitions file it `$ref`s). Only the file that no other schema
+  in the folder references counts as the LOB schema. If a folder holds two
+  unrelated LOB schemas, preflight fails and names them, rather than guessing.
+  The exception is a schema named after a specific PDF, which overrides the LOB
+  schema for that document.
+- **Resolved schema.** `src/schema_resolver.py` combines `common.schema.json` with
+  each LOB schema into one schema per LOB, written to
+  `work/schemas/<lob>.resolved.schema.json`. A per-PDF schema is written to
+  `<lob>--<pdf>.resolved.schema.json`. It handles the three usual ways a LOB
+  schema builds on a common one:
+  - `$ref` into the common file (`"../common.schema.json#/$defs/Money"`) — the
+    definition is copied in;
+  - composition (`"allOf": [{"$ref": "../common.schema.json"}, {...}]`) —
+    flattened into one object, so a closed common schema no longer rejects the
+    LOB's fields;
+  - two standalone schemas — the common top-level fields are merged in.
+
+  Where both define the same field the LOB wins a direct clash. Every overlap and
+  clash is listed in `work/schemas/<lob>.resolve_notes.json`, and preflight
+  prints a summary. `python src/schema_resolver.py` shows what it did per LOB.
+- **Per-LOB prompt (optional).** `prompts/lob/<lob id>.txt` is appended to the
+  shared policy paragraph for that LOB. The id is the folder name lower-cased,
+  with non-alphanumerics as `_` (`Commercial Auto` → `commercial_auto`).
 
 ## How a prompt is assembled
-
-Four blocks, each varying on exactly one axis. Nothing about any document is
-hard-coded; the schema half is generated from whichever schema applies.
 
 | Block | Varies by | Source |
 |---|---|---|
 | role + extraction rules | nothing | `prompts/system_prompt.txt` |
-| document-type paragraph | doc type | `prompts/doctype/<type>.txt` |
+| policy paragraph (+ LOB paragraph) | LOB | `prompts/doctype/policy.txt`, `prompts/lob/<lob>.txt` |
 | modality paragraph | case | `prompts/case_<case>.txt` |
-| value conventions, outline, JSON Schema | schema | derived by `prompting.schema_conventions()` |
+| value conventions, outline, JSON Schema | resolved schema | derived by `prompting.schema_conventions()` |
+| window note (user turn) | window | `prompts/window.txt` |
 
-The user turn adds a per-case preamble (`prompts/user_<case>.txt`) naming the
-document type, then the pages themselves.
+Within a document every case and window shares a byte-identical system prompt
+except the modality paragraph. `report.prompt_integrity()` verifies this from
+what was actually sent. Because the system prompt is identical across windows,
+vLLM's prefix cache serves most of it after the first request; the timing report
+shows the cached tokens.
 
-**Why this keeps the comparison honest.** Within one document type the six cells
-share a byte-identical prompt except the modality paragraph, and for any one
-document and case both models receive byte-identical input. Prompts differ
-*between* document types by design - that is the point of a doc-type-specific
-prompt - so `report.prompt_integrity()` groups its checks by type rather than
-demanding one hash across the whole run.
+## Keeping the context of the whole document
 
-### Value conventions are read off the schema, never assumed
+A window on its own would not know which policy it belongs to, which vehicle a
+continuation row describes, or what a schedule's columns are if the heading was
+two pages back. Four mechanisms carry that context across the split (all in
+`chunking` in `config.yaml`):
 
-A prompt that hard-codes "keep `$2,451` exactly as printed" is right for one
-schema and actively wrong for the next. `schema_conventions()` derives the rules
-instead, so each document type gets the conventions its own schema declares:
+| Mechanism | What it does |
+|---|---|
+| Overlap (`overlap_pages: 1`) | The last page of one window is the first page of the next. |
+| Section-aware boundaries (`section_boundaries`) | Each boundary may move up to 2 pages so the next window starts where a section starts, rather than mid-table. The section starts are found from MinerU's headings, ignoring running headers and page numbers. The plan is made once per document and shared by all three cases. |
+| Reference page (`context.anchor_pages: [1]`) | The declarations page is shown at the start of every later window, marked "reference only", in that case's own modality (image, text, or both). |
+| Context carried forward (`context.carry_forward`) | Each window is told what earlier windows extracted: the policy-level values, and every vehicle, location, coverage or form found so far by its identifying fields. It is asked to reuse those exact names and numbers, and to attach continuing rows to the same parent. |
 
-- closed vs open schema (`additionalProperties: false`)
-- money as an object `{amount, currency}` **or** as a bare number - the rule
-  branches on which shape the schema uses
-- ISO dates, detected from `format: date` **or** a `^\d{4}-\d{2}-\d{2}$` pattern
-- every scalar `$def` that carries a description, quoted verbatim - when a schema
-  says "checkbox: true = marked, false = present and unmarked, null = not
-  confidently readable", that sentence *is* the rule
-- every `enum`, listed as a closed vocabulary
+Some consequences:
+- The carried-forward context is built from the model's own earlier output, never from MinerU text, so PDF only stays image-only.
+- Because each window needs the windows before it, windows run one after another.
+- The extra prompt tokens are counted in the timing report.
+- MinerU runs even for a PDF-only run, because the boundaries are planned from its headings.
+- `report.py` refuses to compare a document's cases if they were split differently.
 
-### What the three document types actually demand
+## How windows are merged
 
-Each doc-type prompt was written against these PDFs, not from a template. The
-recurring finding across all three: **the digital text layer is spatially
-scrambled**, so label↔value and row↔column binding is visual, not textual. That
-is precisely the hypothesis this POC tests.
+`src/chunking.py`:
+- A field only one window filled keeps that value.
+- The same value from two windows (after the scorer's normalisation —
+  `"$1,000"` = 1000, `9/1/2026` = `2026-09-01`) is not a conflict.
+- Different values from two windows: the earlier window wins by default
+  (`chunking.scalar_conflict`), and the conflict is listed in the cell's
+  `meta.json`.
+- Lists of objects are concatenated. An item from a later window that is the
+  **same entity** as one already collected is merged into it instead of being
+  added twice — typically a row on an overlap page, or a vehicle listed on the
+  declarations and again on a schedule. Same entity means:
+  - equal on an identity key in `scoring.entity_lists`; or
+  - agreeing on every field both filled in, which must be at least two fields,
+    or one identifier such as a VIN or form number.
 
-| Type | What the text layer does | The characteristic failure |
-|---|---|---|
-| Policy | 4 of 4 are scans with **zero** embedded text | column ownership; `Included` and `***` are values, not nulls; credits print in parentheses; schedules continue across pages |
-| Loss run | headers and values arrive in separate streams; row identifiers detach to the end of the page | emitting TOTAL / GRAND TOTAL / ALL YEARS rows as if they were individual claims, double-counting the loss history |
-| ACORD | filled values and the pre-printed template are separate layers, so an amount can follow a caption it does not belong to | populating the many empty boxes because their captions exist, manufacturing coverage the insured does not have |
+  Two vehicles that agree only on make = "Honda" stay two vehicles.
+- Items from the same window are never merged with each other.
 
 ## Run order
 
 Each step is cheap and proves the next one is worth attempting.
 
-### 0. Prove the scorer — no GPU, no network, no pod
-
 ```powershell
-python src/selftest.py
+pip install -r requirements.txt                 # once; no torch/vLLM locally
+python src/selftest.py --gold "input/policy/gold/<doc>.gold.json"   # 0. scorer vs YOUR gold, no GPU
+python src/preflight.py --local                  # 1. LOBs, schemas, gold, render, windows, budgets
 ```
 
-Six assertions against your gold. Every one perturbs the gold in a way that must
-not change the score, or must change exactly one field:
+`selftest` assertion 4 names any list of objects without a working identity
+key. Add one under `scoring.entity_lists` in `config.yaml`; the merge uses the
+same keys. Do this once per LOB schema, before the pod exists.
 
-| # | Perturbation | Must give | A failure means |
-|---|---|---|---|
-| 1 | none (gold vs itself) | F1 = 1.000 | normalisation is destroying real values |
-| 2 | — | every list of objects reached | a list vanishes from the metric instead of scoring badly |
-| 3 | dates reformatted M/D/YYYY ↔ ISO | F1 = 1.000 | date normalisation is incomplete |
-| 4 | every list of objects reversed | F1 = 1.000 | **a list lacks a working identity key — the tool names it** |
-| 5 | one repeated field dropped | that field recall 0, others 1 | the metric is not field-localised |
-| 6 | gold cut at 60% of its characters | repair recovers a partial prefix | truncation repair is broken |
+**2. The pod.** The provisioned pod `peuwpamzad828w` already runs everything
+from `/workspace/boot.sh`. Nothing from `pod/` is needed there.
 
-**Assertion 4 is the one that costs real time.** When it fails it names the list;
-go add an identity key for it under `scoring.entity_lists` in `config.yaml` and
-run again. Tuning that until reversal scores 1.000 is required, and it is free —
-do it before the pod exists. Until `input/` is populated the self-test runs
-against a built-in fixture, which proves the code but **not** your config; the
-entity keys must be tuned against your real gold.
+| service | port | started by |
+|---|---|---|
+| Qwen3-VL-8B-Instruct (vLLM 0.26) | 8000 | `svc-vl.sh` |
+| mineru-api (MinerU 4.0.12), used through its `/v1/tasks` API | 8001 | `svc-mineru.sh` |
+| MinerU2.5-Pro VLM, internal | 127.0.0.1:18003 | `svc-mineru-vlm.sh` |
 
-### 1. Local preflight — no network
-
-```powershell
-python src/preflight.py --local
-```
-
-Prints which file it chose as PDF, schema and gold; validates the gold against
-the schema; renders every page; and for each of the six cells prints the image
-count, payload size and projected token use against the context window. Refuses
-(`NO-GO`) on a payload or budget overrun rather than letting you discover it
-after the upload.
-
-### 2. Bring up the pod
-
-RunPod template → **Expose HTTP Ports: `8000,8001,8002`**. Copy `pod/` to
-`/workspace/POC3/pod`, then:
+All three read their settings from `/workspace/serve.conf`. One change is
+needed: the model's context must hold the largest window (about 62k tokens of
+prompt plus a 32k answer).
 
 ```bash
-export POC3_API_KEY=<something long and random>
-bash setup_pod.sh      # installs, asserts the version floor, pre-downloads weights
-bash serve_vllm.sh     # 7B:8000 → health gate → 8B:8001 → health gate → MinerU:8002
+cd /workspace && cp serve.conf serve.conf.bak
+sed -i 's/^VL_LEN=.*/VL_LEN=131072/; s/^VL_UTIL=.*/VL_UTIL=0.62/' serve.conf
+pkill -f "vllm serve /workspace/models/vl/"   # svc-vl.sh restarts it with the new values after 15 s
+tail -f logs/vllm-vl.log                       # wait for "Application startup complete", then Ctrl+C
 ```
 
-The proxy is **public** — anyone with your pod id can use your GPU — so
-`POC3_API_KEY` is not optional. Put the same value in `config.yaml` under
-`pod.api_key` and `pod.ocr_api_key`, along with your `pod.id`.
+On Windows, set the key the pod uses, `API_KEY` in `serve.conf`, with
+`$env:POC3_API_KEY = "..."`. `pod.id` is set in `config.yaml`.
 
-Startup is sequential behind a health gate on purpose: both servers size their KV
-cache from *free* VRAM at startup, so launched together each counts the other's
-not-yet-allocated memory as free and they collectively over-commit.
-
-### 3. Pod preflight — seconds of GPU
+*On a fresh pod without these services*, use this repo's scripts instead:
+expose HTTP ports 8002 and 8003, copy `pod/`, run `bash setup_pod.sh` and
+`bash serve_vllm.sh`, and set `ocr.mode: pod`, `ocr.port: 8002`, and the model's
+port 8003 and name `qwen3-vl-8b` in `config.yaml`.
 
 ```powershell
-python src/preflight.py --pod
+python src/preflight.py --pod                    # 3. model name, real streaming, MinerU /health
+python src/runner.py --mock --mock-profile degraded; python src/report.py   # 4. whole pipeline, no GPU
+python src/runner.py --ocr-only                  # 5. MinerU on every document, timed
+python src/runner.py --ocr-only --force-ocr      #    (optional) another MinerU timing sample
+python src/runner.py --doc <one doc_id> --only md_only   # 6. one real cell - read its raw text
+python src/runner.py                             # 7. everything
+python src/report.py                             # 8. comparison.md + timing.md
 ```
 
-Checks both ports serve the model names `config.yaml` expects, then makes a real
-streaming call to each. It asserts **more than one chunk arrives** — if the proxy
-buffered the stream into a single lump, the 100 s idle timeout would be back in
-play on a real request and you would only find out on the full run. Also confirms
-MinerU reports `models_ready`.
+A real run never resumes over mock output: any cell or window left by step 4 is
+regenerated for real automatically.
 
-### 4. Mock the whole matrix — zero GPU
+Useful flags for `runner.py`:
 
-```powershell
-python src/runner.py --mock --mock-profile degraded
-python src/report.py
-```
+| flag | effect |
+|---|---|
+| `--only md_only,pdf_md` | run only these cases |
+| `--doc <doc_id>` | one document |
+| `--ocr-only` | render + MinerU only, no model calls |
+| `--force-ocr` | re-render and re-run MinerU; each run adds a timing sample, and the report uses the median |
+| `--overwrite` | redo cells and windows that already have output (by default finished work is resumed) |
 
-Synthesizes each answer from your gold and exercises every path: writing,
-parsing, truncation repair, schema validation, scoring, reporting. You get a
-fully populated `output/` tree and a real `comparison.md`. Run each profile once
-— `perfect`, `degraded`, `truncated`, `garbage`. `garbage` must produce a clean
-`INVALID` cell, not a stack trace.
-
-### 5. One real cell, read by hand
-
-```powershell
-python src/runner.py --only 7B/pdf_only
-```
-
-Open its `raw.txt`. This is the only stage where a human reading the output beats
-any assertion.
-
-### 6. The full matrix
-
-```powershell
-python src/runner.py
-python src/report.py
-```
-
-Roughly 10–20 minutes of GPU for all six cells.
+**Resuming.** A window whose request failed on the network (timeout, server
+error, a dropped stream after every retry) is retried on the next run. All of
+that document's finished windows are reused, so only the failed pages cost GPU
+time again.
 
 ## Output
 
 ```
-output/
-  7B/  8B/
-    PDF only/  PDF+MD/  MD only/
-      <doc>.json           the extraction (written even if only a prefix was recoverable)
-      <doc>.raw.txt        raw model text, verbatim — written FIRST, before parsing
-      <doc>.meta.json      tokens, latency, finish_reason, validity, fingerprint, errors
-      <doc>.score.json     per-field P/R/F1 vs gold, entity counts, strict score, coverage
-      <doc>.request.json   redacted request (images → name + size + hash), so cells diff
+output_policies/
+  8B/<MD only | PDF only | PDF+MD>/<LOB folder>/
+    <doc>.json            the merged canonical JSON
+    <doc>.meta.json       status, tokens, latency, per-window summary, merge report, schema check
+    <doc>.score.json      per-field P/R/F1 vs gold, entity counts, strict score, coverage
+    _windows/<doc>/
+      wNN_pAAA-BBB.raw.txt       raw model text for one window, written FIRST
+      wNN_pAAA-BBB.json          that window's parsed JSON
+      wNN_pAAA-BBB.meta.json     that window's tokens and timing, per attempt
+      wNN_pAAA-BBB.request.json  the redacted request (images -> name + size + hash)
   report/
-    comparison.md    the human report
-    comparison.json  everything, machine-readable
-    matrix.csv       one row per cell
-    per_field.csv    field × cell recall grid
+    comparison.md / .json  accuracy, per case and per document
+    matrix.csv, per_field.csv
+    timing.md / .json      MinerU and model timing, end to end, projection
+    mineru_timing.csv, model_latency.csv, end_to_end.csv
+work/ocr_policies/<doc>/   page_N.png, page_N.md, render_meta.json, ocr_meta.json (MinerU timing samples)
+work/schemas/              resolved schemas + resolve notes
 ```
 
-`raw.txt` is written before anything is parsed, so a crash in scoring can never
-cost a GPU call. **Re-scoring never needs the models again**: change
-`scoring.entity_lists` or `scoring.ignore_paths`, re-run `python src/report.py`,
-and the numbers update for free.
+Raw text is written before anything is parsed, so **re-scoring and re-merging
+never need the model again**. Change `scoring.entity_lists` or
+`chunking.scalar_conflict`, delete the cell's `<doc>.meta.json`, re-run
+`runner.py`, and the finished windows are reused from disk.
 
-## Reading the report
+## What the accuracy score counts
 
-Three deltas, three questions:
+The canonical model wraps every value as
+`{raw, parsed, confidence: {score, source}, page_ref, flagged}`, and the gold
+adds `fideon:provenance` and a `text_sections` index of the policy text. Scored
+as-is, the actual values would be only 7–27% of each document's score. The
+score is therefore split:
 
-- **8B − 7B, per case** — is the bigger model better, and in the same places?
-- **PDF+MD − PDF only** — does MinerU markdown help?
-- **PDF+MD − MD only** — do the page images still earn their cost?
+| part | how it is scored | config |
+|---|---|---|
+| **F1** (`field_f1`) | the document's values: `raw`/`parsed` and plain fields such as codes and labels | the default |
+| not scored | `confidence`, `flagged`, `fideon:provenance`, which are the gold pipeline's own bookkeeping | `scoring.ignore_keys` |
+| **page refs** | `page_ref`/`page_range`: where each value is printed | `scoring.page_ref_keys` |
+| **text sec.** | the `text_sections` index, scored as a list matched by content, because its keys are generated strings that no model reproduces | `scoring.separate_sections`, `scoring.keyed_maps` |
 
-Alongside the primary field F1:
+The same rules govern the window merge. A wrapper's `confidence` and `page_ref`
+never decide whether two windows saw the same entity, and differences in them
+are not reported as conflicts. When a value is seen in two windows, its
+`page_ref` collects both pages.
 
-- **strict match rate** — index-path exact match. The *gap* between it and F1 says
-  how much of a difference is ordering and formatting rather than content.
-- **number coverage** — what fraction of the numbers MinerU read off the pages
-  reached the output. This is the key diagnostic for MD-only: if it collapses
-  there, the markdown lost the table, not the model.
-- **entity counts** — gold has 3 vehicles, the cell found 2. A per-field F1 alone
-  hides a list dropped whole.
-- **`*` on a score** — the output was truncated and repaired to its valid prefix.
-  That number is a **floor, not a measurement**. Without this flag, a more verbose
-  model reads as a worse one.
+## Reading the timing report
+
+| measure | what it covers |
+|---|---|
+| MinerU s | Measured **on the pod**, from job start to job end: MinerU's own work, excluding upload, proxy and polling. Each run is a fresh MinerU process, so it includes a fixed start-up and model-load cost. The fit `time ≈ a + b × pages` across documents of different lengths separates the fixed cost `a` from the per-page cost `b`. |
+| end-to-end s (MinerU) | What this machine waited: upload + queue + processing + polling. |
+| first byte s | The first window's time to first token: upload, queue, image encoding and prefill. |
+| model s | Every window's call time added up, retries included: what one document costs. |
+| decode tok/s | Output tokens per second of generation. Output length, not page count, drives most of the model time. |
+| cached | Prompt tokens vLLM served from its prefix cache (the shared schema prompt). |
+| projection | Read off the fitted lines: an estimate inside the measured range of document sizes, an extrapolation outside it. |
+
+`*` on an accuracy score means part of the output was never generated: a window
+was truncated and repaired (REPAIRED), or a window returned no JSON (PARTIAL).
+That score is a **floor, not a measurement**.
 
 ## When something goes wrong
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Preflight `schema <lob>: could not resolve` | the LOB schema `$ref`s a file or definition that is not there | see the error, and `work/schemas/<lob>.resolve_notes.json` |
+| Gold fails validation against the resolved schema | the gold and the schema disagree, or the common/LOB combination is not what was intended | check `resolve_notes.json` (mode, clashes); set `schema_resolution.merge_common_root` |
 | Proxy 502 that looks like "still loading" | server bound `127.0.0.1` | `--host 0.0.0.0` |
-| `NO-GO` on budget | too many image tokens | `render.max_long_side_px` 1024→896→768, or `prompt.max_md_chars_per_page` |
-| vLLM 400 on image count | `--limit-mm-per-prompt` below the page count | raise it *and* `models[].max_images` together |
+| vLLM 400 on image count | a window has more pages than `--limit-mm-per-prompt` | lower `chunking.window_pages`, or raise the flag **and** `models[].max_images` |
+| `NO-GO` on budget | the largest window is too big for the context window | lower `chunking.window_pages`, `render.max_long_side_px` or `prompt.max_md_chars_per_page` |
 | MinerU exits 0, writes nothing | models never downloaded | `mineru-models-download -s huggingface -m pipeline`; `/health` reports `models_ready` |
-| Cells score suspiciously alike | prompt drift, or a case run with another's input | `report.py` says so explicitly; check `conversation_fingerprint` in each `meta.json` |
-| A whole list scores 0 | no working identity key | run `selftest.py`; assertion 4 names the list |
-| Both servers OOM at startup | launched concurrently | start sequentially behind the health gate (`serve_vllm.sh` does) |
-| Markdown looks empty or wrong | cached from a different engine | the cache records its `source`; a mismatch is refused and re-fetched automatically |
-| Mock and real numbers in one table | resumed across run kinds | refused automatically — a real run never resumes over a mock cell |
+| MinerU timing has no breakdown | the pod runs the older `mineru_server.py` | copy the current `pod/` and restart it; preflight warns about this |
+| Many merge conflicts on one field | two windows read a value differently, or the field genuinely changes across the document | read `merge.conflicts` in the cell's `meta.json` |
+| A whole list scores 0 | no working identity key | run `selftest.py --gold ...`; assertion 4 names the list |
+| Markdown looks empty or wrong | cached from a different engine | the cache records its `source`; a mismatch is refused and re-fetched |
 
 ## Ported from
 
-This is not greenfield code. The load-bearing parts come from work that already
-paid for the lessons:
-
-- `D:/POC2/qwen3vl-poc/src/common.py` — `repair_truncated_json` (rewinds a cut-off
-  generation to the last safe cut point and closes open containers, inventing
-  nothing), plus the JSON recovery and schema validation around it.
+- `D:/POC2/qwen3vl-poc/src/common.py` — `repair_truncated_json`, JSON recovery,
+  schema validation.
 - `D:/POC2/qwen3vl-poc/src/prompting.py` — the per-page interleave and
   `conversation_fingerprint`.
-- `D:/POC2/qwen3vl-poc/src/run_ocr.py` — `render_pages`' hard long-side cap, and
-  the MinerU operational lore now in `pod/mineru_ocr.py`: per-page attribution
-  from `*_content_list.json`, keeping `discarded` blocks (MinerU misfiles real
-  content there), and the exit-0-wrote-nothing guard.
-- `D:/RunPod/eval_fields.py` — `_align`, the order-invariant entity matcher, and
-  the normalisation rules, generalised here from loss-runs to any schema.
+- `D:/POC2/qwen3vl-poc/src/run_ocr.py` — the render cap, and the MinerU lessons
+  in `pod/mineru_ocr.py` (per-page attribution from `*_content_list.json`, keeping
+  `discarded` blocks, the exit-0-wrote-nothing guard).
+- `D:/RunPod/eval_fields.py` — the order-invariant entity matcher and
+  normalisation, now also used to merge windows.

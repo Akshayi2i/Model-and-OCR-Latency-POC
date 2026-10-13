@@ -1,0 +1,3 @@
+This request carries file pages {{FIRST}} to {{LAST}} of a {{TOTAL}}-page document. The other pages are extracted in separate requests and all the results are combined afterwards.
+
+Extract only what is printed on the pages given here, into the full schema. For anything that does not appear on these pages, use null for a scalar and [] for an array - do not guess a value that would be printed elsewhere in the document. If a schedule or table continues from an earlier page or onto a later one, extract the rows that are visible here, under the section they belong to.

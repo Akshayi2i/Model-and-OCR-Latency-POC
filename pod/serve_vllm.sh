@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Bring up both models and the MinerU service. Run from /workspace/POC3/pod.
+# Bring up Qwen3-VL-8B and the MinerU service. Run from /workspace/POC3/pod.
 #
 #   export POC3_API_KEY=<the same key you put in config.yaml pod.api_key>
 #   bash serve_vllm.sh
 #
-# RunPod template must expose HTTP ports 8000, 8001 and 8002. They become
-#   https://<POD_ID>-8000.proxy.runpod.net   (Qwen2.5-VL-7B)
-#   https://<POD_ID>-8001.proxy.runpod.net   (Qwen3-VL-8B)
+# RunPod template must expose HTTP ports 8002 and 8003. They become
+#   https://<POD_ID>-8003.proxy.runpod.net   (Qwen3-VL-8B)
 #   https://<POD_ID>-8002.proxy.runpod.net   (MinerU)
+# Port 8001 is NOT usable: RunPod's own nginx holds it on this template.
 set -euo pipefail
 
 : "${POC3_API_KEY:?set POC3_API_KEY - the RunPod proxy is public}"
@@ -34,71 +34,56 @@ wait_ready () {  # port name
 }
 
 # ---------------------------------------------------------------------------
-# Sequential, health-gated startup. This is the single most likely bring-up
-# failure if you skip it: both servers profile FREE VRAM at startup to size their
-# KV cache, so launched together each one counts the other's not-yet-allocated
-# memory as free and they collectively over-commit. Waiting costs a few minutes
-# and removes the failure entirely.
+# vLLM first, behind a health gate, then MinerU: vLLM sizes its KV cache from
+# FREE VRAM at startup, so MinerU must not be loading at the same moment.
 #
-# 0.42 each of 96 GB is ~40 GB apiece, ~80 GB total, leaving ~14 GB for MinerU's
-# pipeline models and CUDA graph overhead. Do not raise it "because it fits" -
-# MinerU shares this GPU.
+# 0.70 of 96 GB is ~67 GB for vLLM: ~17 GB of weights and ~45 GB of KV cache,
+# room for several 131k-token sequences. The remaining ~29 GB is MinerU's
+# (its pipeline models need well under 10 GB) plus CUDA overhead. Do not raise
+# it "because it fits" - MinerU shares this GPU.
 #
-# --max-model-len 98304 must match models[].max_model_len in config.yaml. It is
-# well above the ~40k a PDF+MD request needs, because MinerU markdown size is not
-# known until it runs and a context overflow is discovered only after the images
-# have already been uploaded. Both models support it natively (Qwen2.5-VL 128k,
-# Qwen3-VL 256k) so no rope scaling is involved, and at 0.42 utilisation the KV
-# cache has room for many times this length at --max-num-seqs 4.
+# --max-model-len 131072 must match models[].max_model_len in config.yaml. A
+# window of chunking.window_pages pages in PDF+MD with the schema prompt is far
+# below this; the headroom is for larger windows and long outputs. Qwen3-VL
+# supports 256k natively, so no rope scaling is involved.
+#
+# --limit-mm-per-prompt image:32 must be >= chunking.window_pages and match
+# models[].max_images. It bounds ONE request (one window), not the document.
+#
+# --enable-prompt-tokens-details makes vLLM report how many prompt tokens came
+# from its prefix cache. Every window and every document of a LOB shares one
+# system prompt (the schema block is most of it), so after the first request
+# that prefill is largely free; the timing report shows how much.
 # ---------------------------------------------------------------------------
 
-echo "==> 1/3 Qwen2.5-VL-7B on :8000"
-nohup vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
-  --served-model-name qwen2.5-vl-7b \
-  --host $HOST --port 8000 \
-  --api-key "$POC3_API_KEY" \
-  --dtype bfloat16 \
-  --max-model-len 98304 \
-  --limit-mm-per-prompt '{"image": 24}' \
-  --gpu-memory-utilization 0.42 \
-  --max-num-seqs 4 \
-  --swap-space 8 \
-  > /workspace/logs/vllm_7b.log 2>&1 &
-wait_ready 8000 "Qwen2.5-VL-7B"
-
-echo "==> 2/3 Qwen3-VL-8B on :8001"
+echo "==> 1/2 Qwen3-VL-8B on :8003"
 nohup vllm serve Qwen/Qwen3-VL-8B-Instruct \
   --served-model-name qwen3-vl-8b \
-  --host $HOST --port 8001 \
+  --host $HOST --port 8003 \
   --api-key "$POC3_API_KEY" \
   --dtype bfloat16 \
-  --max-model-len 98304 \
-  --limit-mm-per-prompt '{"image": 24}' \
-  --gpu-memory-utilization 0.42 \
-  --max-num-seqs 4 \
-  --swap-space 8 \
+  --max-model-len 131072 \
+  --limit-mm-per-prompt '{"image": 32}' \
+  --gpu-memory-utilization 0.70 \
+  --max-num-seqs 8 \
+  --enable-prompt-tokens-details \
   > /workspace/logs/vllm_8b.log 2>&1 &
-wait_ready 8001 "Qwen3-VL-8B"
+wait_ready 8003 "Qwen3-VL-8B"
 
-echo "==> 3/3 MinerU on :8002"
+echo "==> 2/2 MinerU on :8002"
 cd "$HERE"
 nohup uvicorn mineru_server:app --host $HOST --port 8002 --workers 1 \
   > /workspace/logs/mineru.log 2>&1 &
 wait_ready 8002 "MinerU"
 
 echo
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader || true
+nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader || true
 echo
-echo "all three services are up. From the Windows box:"
+echo "both services are up. From the Windows box:"
 echo "  python src/preflight.py --pod"
 echo
-echo "logs: /workspace/logs/{vllm_7b,vllm_8b,mineru}.log"
+echo "logs: /workspace/logs/{vllm_8b,mineru}.log"
 echo
 echo "NOTES"
-echo "  --limit-mm-per-prompt must be >= the PDF's page count or vLLM 400s the"
-echo "  request. It is 24 here; raise it AND models[].max_images in config.yaml"
-echo "  together if your document has more pages."
-echo
-echo "  If 8B rejects --mm-processor-kwargs or a log flag on your vLLM build,"
-echo "  drop the flag rather than pinning a version for it. The client-side"
-echo "  render.max_long_side_px cap already bounds the image token budget."
+echo "  If this vLLM build rejects --enable-prompt-tokens-details, drop the flag:"
+echo "  the timing report then shows '-' for cached tokens and nothing else changes."

@@ -1,6 +1,6 @@
 """Single source of truth for the conversation shape.
 
-All six cells build their messages here. The system prompt, the output rules and
+Every case, and every window of a case, builds its messages here. The system prompt, the output rules and
 the schema block are rendered once and shared; exactly ONE paragraph and the
 shape of the user turn vary by case. If the three prompts drift apart, "markdown
 helps" stops being a falsifiable claim, so the shared span is hashed and checked
@@ -57,29 +57,34 @@ def load_schema(cfg: dict, doc=None) -> dict:
         cfgp = (cfg.get("paths") or {}).get("schema")
         p = cfg_path(cfg, "schema") if cfgp else None
     if p is None or not Path(p).exists():
-        where = f"{doc.doc_type}/" if doc is not None and doc.doc_type else ""
+        where = f" (LOB/doc type {doc.doc_type!r})" if doc is not None and doc.doc_type else ""
         raise FileNotFoundError(
-            f"no canonical schema for {getattr(doc, 'doc_id', '?')!r}. Put one under "
-            f"input/{where} - either a schema whose name matches the PDF, or a "
-            f"single schema for the whole doc type. The prompt is generated from it."
+            f"no canonical schema for {getattr(doc, 'doc_id', '?')!r}{where}. Its folder "
+            f"needs one schema (or one named after the PDF), and in LOB mode the common "
+            f"+ LOB schemas must resolve - `python src/preflight.py --local` says why not."
         )
     return read_json(p)
 
 
 def doctype_block(cfg: dict, doc_type: str) -> str:
-    """The document-type paragraph. Empty string when the type has no prompt file."""
+    """The document-type paragraph, plus the LOB's own paragraph if it has one.
+
+    Empty string when the type has no prompt file.
+    """
     if not doc_type:
         return ""
     try:
         spec = cfg_path_doctype(cfg, doc_type)
+        lob = cfg_path_doctype(cfg, doc_type, "lob_prompt")
     except KeyError:
         return ""
-    return read_text(spec).strip() if spec and spec.exists() else ""
+    parts = [read_text(p).strip() for p in (spec, lob) if p and p.exists()]
+    return "\n\n".join(p for p in parts if p)
 
 
-def cfg_path_doctype(cfg: dict, doc_type: str):
+def cfg_path_doctype(cfg: dict, doc_type: str, key: str = "prompt"):
     from common import doc_type_spec
-    rel = doc_type_spec(cfg, doc_type).get("prompt")
+    rel = doc_type_spec(cfg, doc_type).get(key)
     return resolve(rel) if rel else None
 
 
@@ -391,7 +396,7 @@ def build_system_prompt(cfg: dict, case: str, schema: dict, doc_type: str = "") 
 def shared_prompt_span(cfg: dict, schema: dict, doc_type: str = "") -> str:
     """The system prompt with the modality paragraph removed.
 
-    This must hash identically for all six cells OF ONE DOCUMENT TYPE. It is what
+    This must hash identically for every case and window OF ONE DOCUMENT. It is what
     makes the comparison a comparison rather than six unrelated experiments.
     Different doc types legitimately hash differently - that is the point of a
     doc-type-specific prompt - so report.prompt_integrity() groups by type.
@@ -424,9 +429,61 @@ def user_preamble(cfg: dict, case: str, doc_type: str) -> str:
         "{{DOCTYPE_NAME}}", doctype_name(cfg, doc_type)).strip()
 
 
+def _template(cfg: dict, key: str) -> str:
+    rel = (cfg.get("paths") or {}).get(key)
+    return read_text(resolve(rel)).strip() if rel else ""
+
+
+def window_note(cfg: dict, first: int, last: int, total: int,
+                reference: list[int] | None = None) -> str:
+    """The user-turn note telling the model it sees only part of the document,
+    and what the reference pages in front of its pages are."""
+    note = (_template(cfg, "window_prompt")
+            .replace("{{FIRST}}", str(first))
+            .replace("{{LAST}}", str(last))
+            .replace("{{TOTAL}}", str(total)))
+    if reference:
+        ref = _template(cfg, "window_reference_prompt").replace(
+            "{{PAGES}}", ", ".join(str(p) for p in reference))
+        note = f"{note}\n\n{ref}" if ref else note
+    return note.strip()
+
+
+def context_note(cfg: dict, digest: str, through: int) -> str:
+    """The digest of what earlier windows extracted, framed for the model."""
+    if not digest:
+        return ""
+    return (_template(cfg, "window_context_prompt")
+            .replace("{{THROUGH}}", str(through))
+            .replace("{{DIGEST}}", digest)).strip()
+
+
+def _page_blocks(case: str, page: Page, header: str, max_md_chars: int,
+                 truncate_notice: str) -> list[dict]:
+    needs = CASE_NEEDS[case]
+    blocks: list[dict] = [{"type": "text", "text": header}]
+    if needs["png"]:
+        blocks.append({"type": "image", "path": str(Path(page.png).as_posix()),
+                       "name": Path(page.png).name})
+    if needs["md"]:
+        text = _page_markdown(page, max_md_chars, truncate_notice)
+        if text:
+            body = f"OCR text of page {page.index}:\n{text}"
+        elif case == "pdf_md":
+            body = (f"OCR text of file page {page.index}: "
+                    f"(none - read this page from the image)")
+        else:
+            body = (f"OCR text of file page {page.index}: "
+                    f"(none - this page produced no text)")
+        blocks.append({"type": "text", "text": body})
+    return blocks
+
+
 def build_user_content(case: str, pages: list[Page], max_md_chars: int = 20000,
                        truncate_notice: str = "...[page markdown truncated]",
-                       preamble: str = "") -> list[dict]:
+                       preamble: str = "", total_pages: int | None = None,
+                       note: str = "", context: str = "",
+                       reference_pages: list[Page] | None = None) -> list[dict]:
     """User turn: one chunk per page, in reading order.
 
     pdf_md interleaves per page - header, that page's image, that page's OCR -
@@ -436,39 +493,54 @@ def build_user_content(case: str, pages: list[Page], max_md_chars: int = 20000,
     pages a document has. Ported from POC2's build_user_content.
 
     The header line is present in every case so the "account for every page"
-    instruction is equally supported across all three.
+    instruction is equally supported across all three. For a window, `pages` is
+    the window's pages and `total_pages` the whole document's count, so the
+    headers carry the page's real position in the file.
+
+    Window order: preamble, window note, the digest of earlier windows, the
+    reference pages (marked as such), then the pages to extract. Reference
+    pages are given in the case's own modality, like every other page.
     """
-    needs = CASE_NEEDS[case]
-    total = len(pages)
+    total = total_pages or len(pages)
     content: list[dict] = []
-    if preamble:
-        content.append({"type": "text", "text": preamble})
+    for text in (preamble, note, context):
+        if text:
+            content.append({"type": "text", "text": text})
+    for page in reference_pages or []:
+        content += _page_blocks(
+            case, page,
+            f"--- Reference page: file page {page.index} of {total} "
+            f"(context only - not to be extracted here) ---",
+            max_md_chars, truncate_notice)
     for page in pages:
-        content.append({"type": "text", "text": f"--- File page {page.index} of {total} ---"})
-        if needs["png"]:
-            content.append({
-                "type": "image",
-                "path": str(Path(page.png).as_posix()),
-                "name": Path(page.png).name,
-            })
-        if needs["md"]:
-            text = _page_markdown(page, max_md_chars, truncate_notice)
-            if text:
-                body = f"OCR text of page {page.index}:\n{text}"
-            elif case == "pdf_md":
-                body = (f"OCR text of file page {page.index}: "
-                        f"(none - read this page from the image)")
-            else:
-                body = (f"OCR text of file page {page.index}: "
-                        f"(none - this page produced no text)")
-            content.append({"type": "text", "text": body})
+        content += _page_blocks(case, page, f"--- File page {page.index} of {total} ---",
+                                max_md_chars, truncate_notice)
     return content
 
 
 def build_messages(cfg: dict, case: str, pages: list[Page],
-                   schema: dict, doc_type: str = "") -> list[dict]:
-    """The abstract [system, user] conversation for one cell."""
+                   schema: dict, doc_type: str = "",
+                   total_pages: int | None = None,
+                   reference_pages: list[Page] | None = None,
+                   digest: str = "", digest_through: int | None = None) -> list[dict]:
+    """The abstract [system, user] conversation for one cell, or one window of it.
+
+    `pages` is the pages this request carries. When they are not the whole
+    document (total_pages is larger), the window note is added to the user turn,
+    plus - when given - the reference pages and the digest of earlier windows.
+    The system prompt is identical for every window and every document of a LOB,
+    so vLLM's prefix cache can reuse it.
+    """
     prompt_cfg = cfg.get("prompt") or {}
+    total = total_pages or len(pages)
+    note = context = ""
+    refs = reference_pages or []
+    if pages and len(pages) < total:
+        note = window_note(cfg, pages[0].index, pages[-1].index, total,
+                           [p.index for p in refs])
+        context = context_note(cfg, digest, digest_through or pages[0].index - 1)
+    else:
+        refs = []
     return [
         {"role": "system", "content": build_system_prompt(cfg, case, schema, doc_type)},
         {"role": "user", "content": build_user_content(
@@ -476,6 +548,7 @@ def build_messages(cfg: dict, case: str, pages: list[Page],
             int(prompt_cfg.get("max_md_chars_per_page") or 0),
             str(prompt_cfg.get("truncate_md_notice") or "...[truncated]"),
             user_preamble(cfg, case, doc_type),
+            total, note, context, refs,
         )},
     ]
 
@@ -611,14 +684,15 @@ def redact(messages: list[dict]) -> list[dict]:
 
 
 def estimate_tokens(messages: list[dict], pages: list[Page], case: str,
-                    max_tokens: int) -> dict:
-    """Projected prompt size for one cell, against the server's context window.
+                    max_tokens: int, extra_text_chars: int = 0) -> dict:
+    """Projected prompt size for one request, against the server's context window.
 
     Images dominate and are estimated from real pixel dimensions; text is
-    estimated by characters. Run per (model, case): the two models tokenize the
-    same pixels differently, so a budget verified on 7B can still overflow on 8B.
+    estimated by characters. `pages` must include any reference pages, so their
+    dimensions are known. extra_text_chars reserves room for text not known in
+    advance - the digest of earlier windows, which depends on what they extract.
     """
-    text_chars = 0
+    text_chars = int(extra_text_chars)
     image_tokens = 0
     by_index = {p.index: p for p in pages}
     for msg in messages:
