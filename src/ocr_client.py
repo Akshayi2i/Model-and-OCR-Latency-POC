@@ -333,6 +333,54 @@ class MinerUApiClient:
         return md, timing
 
 
+def export_markdown(cfg: dict, docs: list, dest: Path) -> list[Path]:
+    """Write each document's OCR text as one readable file: dest/<LOB>/<doc>.md.
+
+    The per-page cache under the OCR work dir is what the runner feeds the model;
+    this is the deliverable copy of the same text - every page under its own
+    heading, blank pages marked as such, with the engine and timing on top.
+    Documents with no cached markdown are skipped.
+    """
+    from common import doc_type_dir_name
+    written: list[Path] = []
+    for d in docs:
+        ocr_dir = ocr_dir_for(cfg, d.doc_id)
+        n = d.n_pages or page_count(d.pdf)
+        if not has_markdown(ocr_dir, n):
+            continue
+        meta = {}
+        if (ocr_dir / "ocr_meta.json").exists():
+            try:
+                meta = read_json(ocr_dir / "ocr_meta.json")
+            except (ValueError, OSError):
+                meta = {}
+        runs = [r for r in meta.get("timing_runs") or [] if r.get("processing_s") is not None]
+        import statistics
+        proc = statistics.median(r["processing_s"] for r in runs) if runs else None
+        pages = [(ocr_dir / f"page_{i}.md").read_text(encoding="utf-8").strip()
+                 for i in range(1, n + 1)]
+        chars = sum(len(p) for p in pages)
+        head = [
+            f"# OCR text - {d.doc_id}",
+            "",
+            f"- PDF: `{Path(d.pdf).name}`",
+            f"- Line of business: {d.doc_type}",
+            f"- Pages: {n}  |  characters: {chars:,}  |  per page: {chars // max(1, n):,}",
+            f"- Engine: {meta.get('source') or 'unknown'}"
+            + (f"  |  MinerU processing: {proc:.1f} s ({proc / max(1, n):.2f} s/page)"
+               if proc is not None else ""),
+            f"- Pages with (almost) no text: {meta.get('near_empty_pages') or 'none'}",
+        ]
+        body = []
+        for i, text in enumerate(pages, start=1):
+            body += ["", "---", "", f"## Page {i} of {n}", "",
+                     text if text else "_(MinerU returned no text for this page)_"]
+        out = Path(dest) / doc_type_dir_name(cfg, d.doc_type) / f"{d.doc_id}.md"
+        write_text(out, "\n".join(head + body) + "\n")
+        written.append(out)
+    return written
+
+
 def has_markdown(ocr_dir: Path, n_pages: int) -> bool:
     return all((Path(ocr_dir) / f"page_{i}.md").exists() for i in range(1, n_pages + 1))
 

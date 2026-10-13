@@ -549,6 +549,12 @@ def main() -> int:
                  cs["model_latency_s"], cs["s_per_page_overall"])
     log.info("wrote %s", rep_dir / "timing.md")
 
+    # The OCR text itself, one readable file per document, next to the reports.
+    import ocr_client
+    exported = ocr_client.export_markdown(cfg, docs, rep_dir / "ocr")
+    if exported:
+        log.info("wrote OCR markdown for %d document(s) to %s", len(exported), rep_dir / "ocr")
+
     if not rows:
         log.error("no cells found under %s - run src/runner.py first",
                   common.cfg_path(cfg, "output_dir"))

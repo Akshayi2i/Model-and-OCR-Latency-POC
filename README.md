@@ -305,6 +305,8 @@ output_policies/
     matrix.csv, per_field.csv
     timing.md / .json      MinerU and model timing, end to end, projection
     mineru_timing.csv, model_latency.csv, end_to_end.csv
+    ocr/<LOB>/<doc>.md     MinerU's text for the document, page by page, with its
+                           engine, timing and character counts on top
 work/ocr_policies/<doc>/   page_N.png, page_N.md, render_meta.json, ocr_meta.json (MinerU timing samples)
 work/schemas/              resolved schemas + resolve notes
 ```
