@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# The whole test as one job ON THE POD: preflight, the three cases in parallel,
-# a retry pass, the reports. Talks to vLLM and mineru-api on 127.0.0.1, so it
-# needs no laptop, no proxy and no internet once started.
+# The whole test as one job ON THE POD: preflight, the three cases, a retry
+# pass, the reports. Talks to vLLM and mineru-api on 127.0.0.1, so it needs no
+# laptop, no proxy and no internet once started.
+#
+# MODE=sequential (default) - ONE request at a time: policy by policy, and for
+#     each policy MD only, then PDF only, then PDF+MD. Every latency is measured
+#     with the GPU to itself - clean per-policy, per-case timing.
+# MODE=parallel - the three cases at once (vLLM batches them): finishes sooner,
+#     but every latency is measured under shared-GPU load.
 #
 # Start it detached, so closing the terminal / the laptop does not stop it:
 #     cd /workspace/POC3/Model-and-OCR-Latency-POC
@@ -16,8 +22,13 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="${VENV:-/workspace/POC3/venv}"
 SERVE_CONF="${SERVE_CONF:-/workspace/serve.conf}"
-LABEL="${LABEL:-3 cases in parallel on the pod (localhost, vLLM batching)}"
+MODE="${MODE:-sequential}"
 CASES="${CASES:-md_only pdf_only pdf_md}"
+if [ "$MODE" = "parallel" ]; then
+  LABEL="${LABEL:-3 cases in parallel on the pod (localhost, vLLM batching)}"
+else
+  LABEL="${LABEL:-sequential on the pod: one request at a time, policy by policy (localhost)}"
+fi
 LOGS="$REPO/output_policies/logs"
 mkdir -p "$LOGS"
 MAIN_LOG="$LOGS/run_all.log"
@@ -60,16 +71,26 @@ if ! "$PY" src/preflight.py --local > "$LOGS/preflight_local.log" 2>&1; then
 fi
 say "preflight GO (pod and local)"
 
-# --- the three cases, in parallel ------------------------------------------------
+# --- the three cases ---------------------------------------------------------------
 run_pass () {   # pass-number
   local pids=() c
-  for c in $CASES; do
-    "$PY" src/runner.py --only "$c" --label "$LABEL" >> "$LOGS/run_$c.log" 2>&1 &
-    pids+=($!)
-    say "pass $1: started $c (pid $!)"
-  done
-  for p in "${pids[@]}"; do wait "$p"; say "pass $1: pid $p exited rc=$?"; done
+  if [ "$MODE" = "parallel" ]; then
+    for c in $CASES; do
+      "$PY" src/runner.py --only "$c" --label "$LABEL" >> "$LOGS/run_$c.log" 2>&1 &
+      pids+=($!)
+      say "pass $1: started $c (pid $!)"
+    done
+    for p in "${pids[@]}"; do wait "$p"; say "pass $1: pid $p exited rc=$?"; done
+  else
+    # One runner: it goes policy by policy, and within a policy case by case,
+    # so exactly one request is on the GPU at any moment.
+    "$PY" src/runner.py --only "$(echo $CASES | tr ' ' ',')" --label "$LABEL" \
+      >> "$LOGS/run_sequential.log" 2>&1 &
+    say "pass $1: started sequential runner for $CASES (pid $!)"
+    wait $!; say "pass $1: sequential runner exited rc=$?"
+  fi
 }
+say "mode: $MODE - $LABEL"
 run_pass 1
 # A window whose REQUEST failed (timeout, server error) is retried by simply
 # running again; everything finished is skipped.
