@@ -230,6 +230,30 @@ tail -f logs/vllm-vl.log                       # wait for "Application startup c
 On Windows, set the key the pod uses, `API_KEY` in `serve.conf`, with
 `$env:POC3_API_KEY = "..."`. `pod.id` is set in `config.yaml`.
 
+### Running the whole test on the pod (survives a closed laptop)
+
+The job runs entirely on the pod and talks to vLLM and mineru-api on
+`127.0.0.1`, so once it is started it needs no laptop, proxy or internet.
+
+```bash
+cd /workspace/POC3/Model-and-OCR-Latency-POC && git pull
+# the data is git-ignored: bring input/ and work/ (MinerU cache) from the laptop
+runpodctl receive <code>                 # code from: runpodctl send poc3_run.tar.gz
+tar xzf poc3_run.tar.gz input work       # only these two folders
+python3 -m venv /workspace/POC3/venv && /workspace/POC3/venv/bin/pip install -q -r requirements.txt
+nohup setsid bash pod/run_all.sh > /dev/null 2>&1 &
+bash pod/status.sh                       # any time, from any terminal
+```
+
+`pod/run_all.sh` takes the API key from `/workspace/serve.conf`. It then:
+1. runs both preflights, retrying for up to 10 minutes while services start;
+2. runs the three cases in parallel;
+3. runs a second pass to retry any window that failed on the network;
+4. writes the reports.
+
+Logs go to `output_policies/logs/`, and a `DONE` (or `FAILED`) file marks the
+end. Starting it again is safe: finished work is skipped.
+
 *On a fresh pod without these services*, use this repo's scripts instead:
 expose HTTP ports 8002 and 8003, copy `pod/`, run `bash setup_pod.sh` and
 `bash serve_vllm.sh`, and set `ocr.mode: pod`, `ocr.port: 8002`, and the model's

@@ -104,6 +104,10 @@ models:
                                # the largest window (~62k prompt) + a 32k answer
     max_images: 16             # serve.conf VL_LIMIT_MM; >= window_pages +
                                # section_boundaries.max_shift_pages + len(anchor_pages) = 13
+    # Unset = through the RunPod proxy (from a laptop). On the pod itself
+    # pod/run_all.sh sets POC3_VL_BASE_URL=http://127.0.0.1:8000, so the run
+    # needs no proxy, no internet and no laptop.
+    base_url: "${POC3_VL_BASE_URL:-}"
 
 cases: [md_only, pdf_only, pdf_md]
 
@@ -165,6 +169,7 @@ ocr:
   # pymupdf    - embedded text layer only (dry runs; a scan has none)
   mode: mineru_api
   port: 8001                   # serve.conf MINERU_PORT
+  base_url: "${POC3_OCR_BASE_URL:-}"   # on the pod: http://127.0.0.1:8001 (pod/run_all.sh)
   # MinerU 4 parse quality: flash (text layer only - useless on scans) | basic |
   # standard | advanced. On the 4-page homeowners scan, advanced split headers
   # and table captions more finely and ran in 5.2s vs 38.4s for standard (the
