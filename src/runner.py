@@ -364,6 +364,18 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
              budget or (cfg.get("inference") or {}).get("max_tokens", 8192))
 
     merger = chunking.Merger(cfg)
+    prune = bool(ch.get("drop_out_of_window", True)) and len(wins) > 1
+
+    def keep_in_window(m: dict, parsed: Any, first: int, last: int) -> Any:
+        """What this window may contribute: only what it says came from its pages."""
+        if not prune:
+            return parsed
+        kept, n = chunking.prune_out_of_window(parsed, first, last, cfg)
+        m["dropped_out_of_window"] = n
+        if n:
+            log.info("  %s: dropped %d value(s) whose page_ref lies outside pages %d-%d",
+                     m["window"], n, first, last)
+        return kept
 
     def go(i: int, first: int, last: int, digest: str, through: int | None):
         wpages = [by_index[k] for k in range(first, last + 1)]
@@ -378,8 +390,8 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
             futures = [pool.submit(go, i, a, b, "", None)
                        for i, (a, b) in enumerate(wins, start=1)]
             results = [f.result() for f in futures]
-        for m, parsed in results:
-            merger.add(m["window"], parsed)
+        for (m, parsed), (first, last) in zip(results, wins):
+            merger.add(m["window"], keep_in_window(m, parsed, first, last))
     else:
         # Sequential: window k's digest is the merge of windows 1..k-1.
         prev_last = None
@@ -389,7 +401,7 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
                 digest = merger.digest(int(ctx.get("digest_max_chars", 6000)),
                                        int(ctx.get("digest_max_items", 40)))
             m, parsed = go(i, first, last, digest, prev_last)
-            merger.add(m["window"], parsed)
+            merger.add(m["window"], keep_in_window(m, parsed, first, last))
             results.append((m, parsed))
             prev_last = last
     cell_wall_s = round(time.monotonic() - t0, 3)
@@ -483,8 +495,9 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
         "attempts": _sum(m.get("attempts") for m in wmetas),
         "retried_windows": sum(1 for m in wmetas if (m.get("attempts") or 1) > 1),
         "error": "; ".join(f"{m['window']}: {m['error']}" for m in wmetas if m.get("error")) or None,
+        "dropped_out_of_window": _sum(m.get("dropped_out_of_window") for m in wmetas),
         "windows": [{k: m.get(k) for k in (
-            "window", "pages", "reference_pages", "digest_chars", "status",
+            "window", "pages", "reference_pages", "digest_chars", "dropped_out_of_window", "status",
             "prompt_tokens", "completion_tokens", "cached_tokens", "first_byte_s",
             "decode_s", "total_s", "wall_s", "attempts", "finish_reason", "n_images",
             "payload_mb", "error", "reused")}

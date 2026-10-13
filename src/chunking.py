@@ -173,6 +173,57 @@ def window_label(idx: int, first: int, last: int) -> str:
     return f"w{idx:02d}_p{first:03d}-{last:03d}"
 
 
+def prune_out_of_window(obj: Any, first: int, last: int, cfg: dict) -> tuple[Any, int]:
+    """Drop what a window says came from pages outside it.
+
+    A window is shown the declarations page and a list of what earlier windows
+    found, as context; a model can copy those into its answer instead of
+    extracting its own pages (seen on policy-wording pages, which have few
+    fields to fill). Anything whose page_ref / page_range lies entirely outside
+    [first, last] did not come from this window, so it is removed here: a value
+    wrapper keeps its keys with its value emptied, a list item or index entry
+    that is wholly outside is dropped. Values with no page reference are kept -
+    their origin cannot be judged. Returns (pruned object, number removed).
+    """
+    sc = cfg.get("scoring") or {}
+    value_keys = list(sc.get("value_keys") or ("parsed", "raw"))
+    ref_key = "page_ref"
+    removed = 0
+
+    def outside(pages: Any) -> bool:
+        nums = [p for p in (pages or []) if isinstance(p, int)]
+        return bool(nums) and not any(first <= p <= last for p in nums)
+
+    def walk(node: Any) -> Any:
+        nonlocal removed
+        if isinstance(node, dict):
+            if any(k in node for k in value_keys) and ref_key in node:
+                if outside(node.get(ref_key)):
+                    removed += 1
+                    return {**node, **{k: None for k in value_keys if k in node}, ref_key: []}
+                return node
+            rng = node.get("page_range")
+            if isinstance(rng, list) and len(rng) == 2 and all(isinstance(p, int) for p in rng):
+                if rng[1] < first or rng[0] > last:
+                    removed += 1
+                    return None
+            out = {}
+            for k, v in node.items():
+                w = walk(v)
+                if w is None and isinstance(v, dict):
+                    continue            # an index entry wholly outside the window
+                out[k] = w
+            return out
+        if isinstance(node, list):
+            kept = [walk(x) for x in node]
+            return [x for x in kept if x is not None]
+        return node
+
+    if not isinstance(obj, dict):
+        return obj, 0
+    return walk(obj), removed
+
+
 # --------------------------------------------------------------------------- merge
 
 

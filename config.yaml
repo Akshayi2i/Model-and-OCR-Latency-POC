@@ -132,19 +132,23 @@ chunking:
   # from the earlier window (first) or the later one (last). The declarations
   # page usually comes first. Every conflict is listed in the cell's meta.json.
   scalar_conflict: first
-  # Keeping the context of the whole document while extracting one window.
+  # Safety net: a window's values whose page_ref / page_range lies entirely
+  # outside the window's pages did not come from it (a copy), and are dropped
+  # before the merge. The count is recorded per window in meta.json.
+  drop_out_of_window: true
+  # Context from outside a window. BOTH ARE OFF, on evidence: tested on BOP
+  # pages 31-38 (policy wording, MD only), a window given the declarations page
+  # and/or a digest of earlier windows wrote declarations data instead of its
+  # own pages - copied (up to 145 of 151 values not from the window, 19,064
+  # tokens, 334s) or invented and labelled with a window page. Given only its
+  # own pages it wrote nothing that is not on them (5,044 tokens, 110s).
+  # Overlap and section-aware boundaries (below) still carry context safely.
   context:
-    # Pages shown at the start of every window that does not already contain
-    # them, as REFERENCE ONLY - normally the declarations page, which says which
-    # policy, insured, vehicles, locations and coverage parts the rest belongs
-    # to. Shown in the case's own modality (image, markdown or both). [] = off.
-    anchor_pages: [1]
-    # Give each window a digest of what the earlier windows extracted: the
-    # policy-level values and every entity found so far by its identifying
-    # fields, so continuation rows attach to the right parent and the same
-    # entity keeps the same name. Built from the model's own earlier output, in
-    # every case alike - never from MinerU text, so PDF only stays image-only.
-    carry_forward: true
+    # Pages shown at the start of every window that does not contain them, as
+    # reference only. [] = off.
+    anchor_pages: []
+    # Give each window a digest of what earlier windows extracted. Off.
+    carry_forward: false
     digest_max_chars: 6000     # cap on the digest (~1,700 tokens)
     digest_max_items: 40       # entities listed per list before "... and N more"
   # Move each window boundary by up to max_shift_pages so the next window starts

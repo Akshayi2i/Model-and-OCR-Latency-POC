@@ -156,20 +156,34 @@ shows the cached tokens.
 
 A window on its own would not know which policy it belongs to, which vehicle a
 continuation row describes, or what a schedule's columns are if the heading was
-two pages back. Four mechanisms carry that context across the split (all in
-`chunking` in `config.yaml`):
+two pages back. These mechanisms carry context across the split, all set under
+`chunking` in `config.yaml`:
 
-| Mechanism | What it does |
-|---|---|
-| Overlap (`overlap_pages: 1`) | The last page of one window is the first page of the next. |
-| Section-aware boundaries (`section_boundaries`) | Each boundary may move up to 2 pages so the next window starts where a section starts, rather than mid-table. The section starts are found from MinerU's headings, ignoring running headers and page numbers. The plan is made once per document and shared by all three cases. |
-| Reference page (`context.anchor_pages: [1]`) | The declarations page is shown at the start of every later window, marked "reference only", in that case's own modality (image, text, or both). |
-| Context carried forward (`context.carry_forward`) | Each window is told what earlier windows extracted: the policy-level values, and every vehicle, location, coverage or form found so far by its identifying fields. It is asked to reuse those exact names and numbers, and to attach continuing rows to the same parent. |
+| Mechanism | Status | What it does |
+|---|---|---|
+| Overlap (`overlap_pages: 1`) | **on** | The last page of one window is the first page of the next. |
+| Section-aware boundaries (`section_boundaries`) | **on** | Each boundary may move up to 2 pages so the next window starts where a section starts, rather than mid-table. Section starts come from MinerU's headings, ignoring running headers and page numbers. The plan is made once per document and shared by all three cases. |
+| Out-of-window safety net (`drop_out_of_window`) | **on** | A value whose `page_ref`/`page_range` lies entirely outside its window did not come from it, so it is dropped before the merge. The count is recorded per window in `meta.json`. |
+| Reference page (`context.anchor_pages`) | **off** | Showed the declarations page to every later window. |
+| Digest of earlier windows (`context.carry_forward`) | **off** | Told each window what earlier windows had extracted. |
 
-Some consequences:
-- The carried-forward context is built from the model's own earlier output, never from MinerU text, so PDF only stays image-only.
-- Because each window needs the windows before it, windows run one after another.
-- The extra prompt tokens are counted in the timing report.
+**Why the last two are off.** They were tested on BOP pages 31–38 (policy
+wording, MD only), checking each extracted value against the OCR text of those
+pages:
+
+| context given to the window | values not from its own pages | tokens / time |
+|---|---:|---|
+| page 1 + digest (the earlier default) | 145 of 151 | 19,064 / 334 s |
+| page 1 only | 99 of 135 | 11,018 / 211 s |
+| digest of entities only | 90 of 117 | 9,120 / 197 s |
+| its own pages only | **0 of 0** | **5,044 / 110 s** |
+
+Given pages with nothing to fill, the model reproduced declarations data from
+the context it was shown, either copied or invented and labelled with a window
+page. With only its own pages, it wrote nothing that is not on them, and did so
+fastest.
+
+Other consequences:
 - MinerU runs even for a PDF-only run, because the boundaries are planned from its headings.
 - `report.py` refuses to compare a document's cases if they were split differently.
 
