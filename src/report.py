@@ -528,6 +528,12 @@ def main() -> int:
     log = common.setup_logging("report", (cfg.get("runtime") or {}).get("log_level", "INFO"))
 
     rows = load_cells(cfg)
+    # Only the documents this run covers, so leftovers from a wider run in the
+    # same output folder never enter this run's tables.
+    wanted = (cfg.get("corpus") or {}).get("documents")
+    if wanted:
+        wanted = {str(w) for w in wanted}
+        rows = [r for r in rows if r["doc_id"] in wanted or r.get("doc_type") in wanted]
     rep_dir = common.ensure_dir(common.cfg_path(cfg, "report_dir"))
     formats = [str(f).lower() for f in ((cfg.get("report") or {}).get("formats")
                                         or ["json", "md", "csv"])]
@@ -562,6 +568,25 @@ def main() -> int:
 
     integrity = prompt_integrity(rows, cfg)
     matrix = matrix_table(rows)
+
+    if not bool((cfg.get("scoring") or {}).get("enabled", True)):
+        # Extraction + timing only: no accuracy report. timing.md is the report;
+        # extraction.csv lists every document x case with its status and cost.
+        keep = ["doc_type", "doc_id", "case", "n_pages", "n_windows", "status",
+                "schema_ok", "json_valid_strict", "repaired", "failed_windows",
+                "merged_entities", "merge_conflicts", "n_images", "prompt_tokens",
+                "completion_tokens", "first_byte_s", "total_s", "latency_per_page_s",
+                "attempts", "error"]
+        if "csv" in formats:
+            write_csv(matrix, rep_dir / "extraction.csv", keep)
+        log.info("scoring off: wrote %s (no accuracy report)", rep_dir / "extraction.csv")
+        if not integrity["ok"]:
+            for p in integrity["problems"]:
+                log.error("  %s", p)
+        else:
+            log.info("prompt integrity OK across %d cells", len(rows))
+        return 0 if integrity["ok"] else 1
+
     deltas = pairwise_deltas(rows)
     grids = per_field_grid(
         rows, int((cfg.get("report") or {}).get("per_field_min_gold", 1)))

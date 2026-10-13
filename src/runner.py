@@ -83,6 +83,11 @@ def cells(cfg: dict, only: str | None = None) -> list[Cell]:
     return out
 
 
+def scoring_enabled(cfg: dict) -> bool:
+    """scoring.enabled: false = extraction + timing only (no F1, no gold read)."""
+    return bool((cfg.get("scoring") or {}).get("enabled", True))
+
+
 def windows_need_markdown(cfg: dict) -> bool:
     """Section-aware windows are planned from MinerU's headings, so MinerU must
     run even when only PDF only is requested. PDF only never SEES the markdown."""
@@ -496,7 +501,7 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
     }
     common.write_json(out_dir / f"{stem}.meta.json", meta)
 
-    if gold is not None:
+    if gold is not None and scoring_enabled(cfg):
         ocr_text = ""
         if (cfg.get("scoring") or {}).get("coverage_report", True):
             ocr_text = "\n\n".join(
@@ -521,7 +526,11 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
                  merge_report["conflict_count"],
                  "  (FLOOR)" if score["score_is_floor"] else "")
     else:
-        log.info("  %s  (no gold - not scored)  latency %.1fs", status, model_latency_s)
+        log.info("  %s  latency %.1fs (%.2fs/page), %s tokens out, schema %s%s",
+                 status, model_latency_s, meta["latency_per_page_s"] or 0.0,
+                 meta["completion_tokens"], "ok" if schema_ok else
+                 f"{len(schema_errors)} error(s)",
+                 "" if scoring_enabled(cfg) else "  (scoring off)")
 
     return meta
 
@@ -609,7 +618,10 @@ def main() -> int:
 
     # ---- phase 2: the model, case by case within each document
     for doc_id, (doc, schema, per_case) in prepared.items():
-        gold = common.read_json(doc.gold) if doc.gold else None
+        # Gold is read only when something uses it: scoring, or sizing the
+        # output budget from it. An extraction + timing run touches no gold.
+        need_gold = scoring_enabled(cfg) or (cfg.get("inference") or {}).get("budget_from_gold")
+        gold = common.read_json(doc.gold) if (doc.gold and need_gold) else None
         for cell in plan:
             out_dir = common.out_dir_for(cfg, cell.model_tag, cell.case, doc.doc_type)
             done = out_dir / f"{doc.doc_id}.meta.json"

@@ -74,8 +74,9 @@ schema_resolution:
   merge_common_root: auto
 
 corpus:
-  documents: null              # null = every PDF under input_dir. Or a list of doc_ids / LOB ids.
-  require_gold: true           # false = run inference on unpaired PDFs, skip scoring
+  # The run: 5 policies spanning 8-111 pages (null = every document in the manifest).
+  documents: [endorsement_capi056240, inmrc, health_main, policy_01, bop]
+  require_gold: false          # extraction + timing only: a gold file is not needed
   # Stripped from a file stem when pairing a PDF with its gold JSON.
   gold_suffixes: [extraction, extracted, gold, golden, groundtruth, gt,
                   expected, label, labels, labelled, labeled, annotation,
@@ -195,13 +196,17 @@ inference:
   temperature: 0.0
   top_p: 1.0
   seed: 0
-  # Fallback only, for a document with no gold to size against.
-  max_tokens: 16384
+  # Output budget per window when budget_from_gold is false (and the fallback for
+  # a document with no gold when it is true).
+  max_tokens: 32768
   # The output budget is derived from the gold for THIS document - one number
   # per document, identical across its windows and its three cases. A window
   # emits at most the whole document's answer, so the whole-document budget is
   # always enough for a window.
-  budget_from_gold: true
+  # false = every window may write up to max_tokens (above), with no gold involved.
+  # A window stops as soon as its JSON is complete, so a large ceiling costs
+  # nothing; it only prevents cut-off answers.
+  budget_from_gold: false
   chars_per_token: 3.77        # measured on pretty-printed canonical JSON
   budget_margin: 1.6           # models emit nulls, repeated keys and whitespace the gold does not
   budget_floor: 16384          # the budget may only rise above this, never fall below
@@ -222,6 +227,9 @@ prompt:
   truncate_md_notice: "...[page markdown truncated]"
 
 scoring:
+  # false = extraction + timing only: no F1/precision/recall, no score files, no
+  # accuracy report; gold files are not read. true = score every cell vs its gold.
+  enabled: false
   primary_metric: field_f1
   auto_entity_lists: true      # any unlisted list-of-dicts aligns by value similarity
   # list path -> ordered identity-key attempts. Each attempt is an AND-group of

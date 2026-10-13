@@ -17,7 +17,7 @@ for c in $CASES; do
   d="$REPO/output_policies/8B/${DIR[$c]}"
   n=$(find "$d" -maxdepth 2 -name '*.meta.json' -not -path '*/_windows/*' 2>/dev/null | wc -l)
   w=$(find "$d" -path '*/_windows/*' -name '*.meta.json' 2>/dev/null | wc -l)
-  echo; echo "== $c: $n/10 documents done, $w windows done"
+  echo; echo "== $c: $n documents done, $w windows done"
   [ -f "$LOGS/run_$c.log" ] && grep -vE "page images cached|markdown cache hit" "$LOGS/run_$c.log" | tail -n 2 | cut -c1-200
 done
 

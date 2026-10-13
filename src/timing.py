@@ -401,16 +401,18 @@ def render_md(t: dict) -> str:
           "out, which grow with how much the document says, not only how many pages "
           "it has.")
         a("")
-        a("| LOB | document | pages | case | windows | status | tokens in | cached | tokens out | first byte s | model s | s/page | decode tok/s | attempts | F1 |")
-        a("|---|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        scored = any(r.get("field_f1") is not None for r in t["model"])
+        a("| LOB | document | pages | case | windows | status | tokens in | cached | tokens out | first byte s | model s | s/page | decode tok/s | attempts |"
+          + (" F1 |" if scored else ""))
+        a("|---|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|" + ("---:|" if scored else ""))
         for r in t["model"]:
             flag = " (resumed)" if r.get("resumed") else ""
             a(f"| {r['lob']} | {r['doc_id']} | {r['pages']} | {r['label']} | {r['windows']} | "
               f"{r['status']} | {_f(r['prompt_tokens'])} | {_f(r['cached_tokens'])} | "
               f"{_f(r['completion_tokens'])} | {_f(r['first_byte_s'])} | "
               f"{_f(r['model_latency_s'], 1)}{flag} | {_f(r['latency_per_page_s'])} | "
-              f"{_f(r['decode_tokens_per_s'], 1)} | {_f(r['attempts'])} | "
-              f"{_f(r['field_f1'], 3)} |")
+              f"{_f(r['decode_tokens_per_s'], 1)} | {_f(r['attempts'])} |"
+              + (f" {_f(r['field_f1'], 3)} |" if scored else ""))
         a("")
 
     if t["end_to_end"]:

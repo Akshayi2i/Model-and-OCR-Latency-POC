@@ -177,9 +177,20 @@ def check_local(cfg: dict, ck: Checks) -> dict:
             ck.add(OK, "common schema", str(cpath.relative_to(common.ROOT))
                    if cpath.is_relative_to(common.ROOT) else str(cpath))
 
+    scoring_on = bool((cfg.get("scoring") or {}).get("enabled", True))
     docs, unpaired, orphan_golds = common.discover_documents(
         cfg, tuple((cfg.get("corpus") or {}).get("gold_suffixes")
                    or common.DEFAULT_GOLD_SUFFIXES))
+    # Only the documents this run covers (corpus.documents), as the runner does.
+    wanted = (cfg.get("corpus") or {}).get("documents")
+    if wanted:
+        wanted = {str(w) for w in wanted}
+        missing = sorted(wanted - {d.doc_id for d in docs} - {d.doc_type for d in docs})
+        if missing:
+            ck.add(BAD, "corpus.documents", f"not in the manifest/inputs: {missing}")
+        docs = [d for d in docs if d.doc_id in wanted or d.doc_type in wanted]
+    ck.add(OK, "run scope", f"{len(docs)} document(s); scoring "
+           + ("on (F1 vs gold)" if scoring_on else "off - extraction + timing only"))
     if not docs:
         ck.add(BAD, "documents",
                f"no PDF found under {input_dir}. Expected one folder per "
@@ -225,18 +236,21 @@ def check_local(cfg: dict, ck: Checks) -> dict:
     for d in docs:
         bits = [f"pdf={d.pdf.name}"]
         bits.append(f"schema={d.schema.name}" if d.schema else "NO SCHEMA")
-        bits.append(f"gold={d.gold.name}" if d.gold else "NO GOLD")
-        status = OK if (d.schema and d.gold) else (WARN if d.schema else BAD)
+        if scoring_on:
+            bits.append(f"gold={d.gold.name}" if d.gold else "NO GOLD")
+        status = (OK if (d.schema and (d.gold or not scoring_on))
+                  else (WARN if d.schema else BAD))
         ck.add(status, f"{d.doc_type}/{d.doc_id}", "  ".join(bits))
         if d.schema:
             try:
                 schemas[d.doc_id] = prompting.load_schema(cfg, d)
             except Exception as exc:  # noqa: BLE001
                 ck.add(BAD, f"schema unreadable  {d.doc_id}", str(exc))
-    for g in orphan_golds:
+    for g in (orphan_golds if scoring_on else []):
         ck.add(WARN, "unpaired gold", g.name)
 
-    scored = [d for d in docs if d.gold and d.schema]
+    # Extraction + timing only: no gold is validated or checked for prompt leaks.
+    scored = [d for d in docs if d.gold and d.schema] if scoring_on else []
     for d in scored:
         gold = common.read_json(d.gold)
         ok, errors = common.validate_against_schema(gold, d.schema)
