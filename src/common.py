@@ -857,6 +857,30 @@ def repair_truncated_json(text: str) -> tuple[Any | None, str]:
     return None, "could not repair truncated JSON"
 
 
+_ESCAPE_RE = re.compile(r'\\(["\\/bfnrt]|u[0-9a-fA-F]{4})?')
+
+
+def drop_invalid_escapes(text: str) -> tuple[str, int]:
+    """Drop every backslash that starts no valid JSON escape. Returns (text, count).
+
+    MinerU writes markdown, and markdown escapes characters: a blank on a form
+    ("NO. ____") comes out as "NO. \\_\\_\\_\\_". A model that copies the value
+    verbatim puts "\\_" in a JSON string, which json.loads rejects outright - a
+    whole window lost to one character. Without the backslash the value reads as
+    the page does. Valid escapes, an escaped backslash included, are kept.
+    """
+    n = 0
+
+    def fix(m: re.Match) -> str:
+        nonlocal n
+        if m.group(1):
+            return m.group(0)
+        n += 1
+        return ""
+
+    return _ESCAPE_RE.sub(fix, text), n
+
+
 def recover_json_object(text: str) -> tuple[Any | None, str, bool]:
     """Parse model output, falling back to truncation repair.
 
@@ -867,6 +891,15 @@ def recover_json_object(text: str) -> tuple[Any | None, str, bool]:
     parsed, reason = extract_json_object(text)
     if parsed is not None:
         return parsed, reason, False
+    # Stray markdown escapes are the one syntax error whose fix loses nothing:
+    # drop the backslashes and parse again before cutting anything off.
+    fixed, n_fixed = drop_invalid_escapes(text or "")
+    if n_fixed:
+        parsed, fixed_reason = extract_json_object(fixed)
+        if parsed is not None:
+            return parsed, (f"{fixed_reason} after dropping {n_fixed} invalid "
+                            f"backslash escape(s)"), False
+        text = fixed
     parsed, repair_reason = repair_truncated_json(text or "")
     if parsed is not None:
         return parsed, f"{reason}; {repair_reason}", True

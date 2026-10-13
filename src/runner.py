@@ -228,6 +228,19 @@ def run_window(cfg: dict, cell: Cell, doc, wpages: list[render.Page], n_total: i
                 and prior.get("mock") == mock
                 and window_is_final(prior, budget, cell.served_name)):
             parsed = common.read_json(json_path) if json_path.exists() else None
+            raw_path = win_dir / f"{label}.raw.txt"
+            if prior.get("status") == "INVALID" and raw_path.exists():
+                # The answer is kept; only reading it failed. A parser that has
+                # learned since may read it now - no model call, same timing.
+                parsed, note, repaired = common.recover_json_object(
+                    raw_path.read_text(encoding="utf-8"))
+                if parsed is not None:
+                    common.write_json(json_path, parsed)
+                    prior.update(parsed=True, repaired_from_truncation=repaired,
+                                 parse_note=note, reparsed_at=common.utc_now_iso(),
+                                 status="REPAIRED" if repaired else "OK")
+                    common.write_json(meta_path, prior)
+                    log.info("  %s re-read from its stored answer: %s", label, note)
             log.info("  %s reused (%s)", label, prior.get("status"))
             prior["reused"] = True
             return prior, parsed
@@ -442,7 +455,18 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
     # clock of a resumed cell is not a measurement, so it is flagged.
     model_latency_s = round(sum(m.get("wall_s") or 0.0 for m in wmetas), 3)
     reused = sum(1 for m in wmetas if m.get("reused"))
-    fps = "|".join(m.get("conversation_fingerprint", "") for m in wmetas)
+    wall_resumed = bool(reused)
+    if wmetas and reused == len(wmetas):
+        # Nothing was generated now (a re-merge): keep the wall clock measured
+        # when the windows actually ran, not the milliseconds of this pass.
+        try:
+            before = common.read_json(out_dir / f"{stem}.meta.json")
+        except (ValueError, OSError):
+            before = {}
+        if before.get("model_wall_s") is not None:
+            cell_wall_s = before["model_wall_s"]
+            wall_resumed = bool(before.get("wall_is_resumed"))
+    fps ="|".join(m.get("conversation_fingerprint", "") for m in wmetas)
     decode = _sum(m.get("decode_s") for m in wmetas)
     out_tok = _sum(m.get("completion_tokens") for m in wmetas)
 
@@ -485,7 +509,7 @@ def run_cell(cfg: dict, cell: Cell, doc, pages: list[render.Page], schema: dict,
         "first_byte_s": wmetas[0].get("first_byte_s") if wmetas else None,
         "model_latency_s": model_latency_s,
         "model_wall_s": cell_wall_s,
-        "wall_is_resumed": bool(reused),
+        "wall_is_resumed": wall_resumed,
         "windows_reused": reused,
         "latency_per_page_s": round(model_latency_s / n_total, 3) if n_total else None,
         "decode_s": decode,
@@ -650,14 +674,21 @@ def main() -> int:
                 # windows are reused, so only the failed ones cost GPU time.
                 net_failed = [w.get("window") for w in prior.get("windows") or []
                               if w.get("error")]
+                # A window the parser could not read is re-read from its stored
+                # answer (no model call), so a cell missing pages is re-merged.
+                unread = [w.get("window") for w in prior.get("windows") or []
+                          if w.get("status") == "INVALID" and not w.get("error")]
                 if bool(prior.get("mock")) == bool(rt.get("mock")) \
-                        and prior.get("status") != "ERROR" and not net_failed:
+                        and prior.get("status") != "ERROR" and not net_failed and not unread:
                     log.info("%s %s - already done, skipping (--overwrite to redo)",
                              cell.label, doc.doc_id)
                     continue
                 if net_failed:
                     log.info("%s %s - retrying %d window(s) whose request failed: %s",
                              cell.label, doc.doc_id, len(net_failed), ", ".join(net_failed))
+                if unread:
+                    log.info("%s %s - re-reading %d window(s) that did not parse: %s",
+                             cell.label, doc.doc_id, len(unread), ", ".join(unread))
                 if bool(prior.get("mock")) != bool(rt.get("mock")):
                     log.warning("%s %s - existing output is %s but this run is %s; redoing",
                                 cell.label, doc.doc_id,
